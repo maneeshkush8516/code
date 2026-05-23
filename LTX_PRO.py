@@ -2482,6 +2482,16 @@ def generate_pro(
     unet_model:              str   = None,   # None → use UNET_MODEL global
     clip_name1:              str   = None,   # None → use CLIP_NAME1 global
     clip_name2:              str   = None,   # None → use CLIP_NAME2 global
+    # ── New feature parameters (FEAT-003) ────────────────────────────────
+    color_grade:             str   = None,   # None -> use COLOR_GRADE global
+    use_color_matching:      bool  = None,   # None -> use USE_COLOR_MATCHING global
+    reference_histogram:     object = None,  # np.ndarray from extract_color_histogram
+    use_quality_gate:        bool  = None,   # None -> use USE_QUALITY_GATE global
+    use_multi_resolution:    bool  = None,   # None -> use USE_MULTI_RESOLUTION global
+    export_timeline:         bool  = None,   # None -> use EXPORT_TIMELINE global
+    persist_to_gdrive:       bool  = None,   # None -> use PERSIST_TO_GDRIVE global
+    timeline_entries:        list  = None,   # Mutable list for accumulating timeline data
+    embedding_bank:          object = None,  # CharacterEmbeddingBank instance
 ) -> Optional[str]:
     """
     LTX-2 PRO — Two-pass generation pipeline with Character Consistency.
@@ -2586,12 +2596,33 @@ def generate_pro(
     _clip1      = clip_name1  if clip_name1  is not None else CLIP_NAME1
     _clip2      = clip_name2  if clip_name2  is not None else CLIP_NAME2
 
+    # Resolve new feature flags (FEAT-003)
+    _color_grade = color_grade if color_grade is not None else COLOR_GRADE
+    _use_color_matching = use_color_matching if use_color_matching is not None else USE_COLOR_MATCHING
+    _use_quality_gate = use_quality_gate if use_quality_gate is not None else USE_QUALITY_GATE
+    _use_multi_res = use_multi_resolution if use_multi_resolution is not None else USE_MULTI_RESOLUTION
+    _export_timeline = export_timeline if export_timeline is not None else EXPORT_TIMELINE
+    _persist_to_gdrive = persist_to_gdrive if persist_to_gdrive is not None else PERSIST_TO_GDRIVE
+
     print("🎬 LTX-2 PRO — Generation Starting")
     print(f"   Resolution   : {width}×{height}  |  Frames: {frames}  |  Seed: {seed}")
     print(f"   Mode         : {'I2V' if image_path else 'T2V'}"
           f"  |  Character: {_char_mode}  |  Pro: {pro_mode}")
     print(f"   Easy Prompt  : {'BYPASS' if _bypass else f'LLM={_llm_model}'}")
     _print_vram()
+
+    # ── Multi-resolution override (FEAT-003) ──────────────────────────────
+    if _use_multi_res:
+        try:
+            _shot_type = detect_shot_type(user_input or positive_prompt)
+            _new_w, _new_h, _anchor_w = get_resolution_for_shot(_shot_type, width, height)
+            if _new_w != width or _new_h != height:
+                print(f"   Multi-res    : {_shot_type} shot -> {_new_w}x{_new_h} (anchor={_anchor_w:.2f})")
+                width, height = _new_w, _new_h
+                if _shot_type == "closeup":
+                    character_strength = min(1.0, character_strength * _anchor_w)
+        except Exception as e:
+            print(f"   ⚠️  Multi-resolution failed ({e}) - using original resolution")
 
     # ── Pre-flight model check ─────────────────────────────────────────────
     print("\n🔍 Model file check…")
@@ -3230,6 +3261,32 @@ def generate_pro(
         del vae_audio
         aggressive_cleanup("audio VAE done")
 
+        # ── POST-PROCESSING: Color matching & grading (FEAT-003) ──────────
+        if decoded_frames is not None:
+            # Color histogram matching (style transfer from reference)
+            if _use_color_matching and reference_histogram is not None:
+                try:
+                    decoded_frames = match_color_histogram(decoded_frames, reference_histogram)
+                    print("   ✓ Color histogram matching applied")
+                except Exception as e:
+                    print(f"   ⚠️  Color matching failed ({e}) - continuing without.")
+
+            # Color grading preset
+            if _color_grade and _color_grade != "none":
+                try:
+                    decoded_frames = apply_color_grade(decoded_frames, _color_grade)
+                    print(f"   ✓ Color grade applied: {_color_grade}")
+                except Exception as e:
+                    print(f"   ⚠️  Color grading failed ({e}) - continuing without.")
+
+            # Character embedding bank accumulation
+            if embedding_bank is not None:
+                try:
+                    embedding_bank.accumulate(decoded_frames[-1:])
+                    print(f"   ✓ Character embedding bank updated ({embedding_bank.count} samples)")
+                except Exception as e:
+                    print(f"   ⚠️  Embedding bank update failed ({e})")
+
         # ══════════════════════════════════════════════════════════════════
         # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
         # ══════════════════════════════════════════════════════════════════
@@ -3311,6 +3368,20 @@ def generate_pro(
     elapsed = time.time() - t0
     mins, secs = divmod(int(elapsed), 60)
 
+    # ── Quality gate check (FEAT-003) ─────────────────────────────────────
+    quality_scores = None
+    if _use_quality_gate and decoded_frames is not None:
+        try:
+            quality_scores = compute_segment_quality(decoded_frames)
+            if quality_scores.get("passed"):
+                print(f"   ✓ Quality gate PASSED (SSIM={quality_scores.get('ssim', 0):.3f}, "
+                      f"hist={quality_scores.get('histogram', 0):.3f})")
+            else:
+                print(f"   ⚠️  Quality gate FAILED (SSIM={quality_scores.get('ssim', 0):.3f}, "
+                      f"hist={quality_scores.get('histogram', 0):.3f})")
+        except Exception as e:
+            print(f"   ⚠️  Quality gate check failed ({e})")
+
     # ── Metadata JSON sidecar ─────────────────────────────────────────────
     _active_loras = [s["lora"] for s in _lora_stack if s.get("on")]
     meta = {
@@ -3334,9 +3405,38 @@ def generate_pro(
         "unet_model"        : UNET_MODEL,
         "elapsed_seconds"   : elapsed,
         "output_path"       : output_path,
+        "quality_scores"    : quality_scores,
     }
     if output_path:
         save_metadata_sidecar(output_path, meta)
+
+    # ── Google Drive sync (FEAT-003) ──────────────────────────────────────
+    if _persist_to_gdrive and output_path:
+        try:
+            sync_to_drive(output_path, GDRIVE_PATH)
+        except Exception as e:
+            print(f"   ⚠️  Drive sync failed ({e})")
+
+    # ── Timeline entry (FEAT-003) ─────────────────────────────────────────
+    if _export_timeline and timeline_entries is not None:
+        try:
+            timeline_entries.append({
+                "segment_index": len(timeline_entries),
+                "output_path": output_path,
+                "seed": seed,
+                "prompt": final_positive[:200],
+                "user_input": user_input[:100] if user_input else "",
+                "width": width,
+                "height": height,
+                "frames": frames,
+                "fps": fps,
+                "duration_seconds": frames / fps,
+                "timestamp_start": sum(e.get("duration_seconds", 0) for e in timeline_entries),
+                "character_name": character_name,
+                "quality_scores": quality_scores,
+            })
+        except Exception as e:
+            print(f"   ⚠️  Timeline entry failed ({e})")
 
     print(f"\n✅ Done in {mins}m {secs}s")
     print(f"   📁 {output_path}")
@@ -3428,6 +3528,23 @@ def generate_extended_video(
     # Track all generated frame tensors for final stitching
     all_segment_paths = []
     current_anchor_path = image_path  # Start with user's input image
+
+    # ── Initialize advanced features (FEAT-003) ──────────────────────────
+    _timeline_entries = [] if EXPORT_TIMELINE else None
+    _embedding_bank = CharacterEmbeddingBank() if USE_CHARACTER_EMBEDDING_BANK else None
+    _reference_histogram = None  # Set after first segment
+
+    # ── Audio sync: adjust segment boundaries (FEAT-003) ─────────────────
+    segment_lengths = [segment_length] * max_segments
+    if USE_AUDIO_SYNC and AUDIO_SYNC_PATH:
+        try:
+            beats = detect_beats(AUDIO_SYNC_PATH, AUDIO_BPM)
+            if beats:
+                segment_lengths = compute_segment_boundaries(beats, fps, segment_length)
+                segment_lengths = segment_lengths[:max_segments]
+                print(f"   Audio sync: {len(segment_lengths)} segments synced to beats")
+        except Exception as e:
+            print(f"   ⚠️  Audio sync failed ({e}) - using fixed segment length")
     
     for seg_idx in range(max_segments):
         seg_num = seg_idx + 1
@@ -3444,7 +3561,60 @@ def generate_extended_video(
             current_anchor_path = anchor_path
             continue
         
+        # ── Motion coherence & adaptive overlap (FEAT-003) ────────────────
+        _seg_overlap = overlap_frames
+        _seg_lora_stack = None  # Will override if motion coherence active
+
+        if seg_idx > 0 and current_anchor_path:
+            # Adaptive overlap computation
+            if USE_ADAPTIVE_OVERLAP and len(all_segment_paths) > 0:
+                try:
+                    import imageio as _iio
+                    _prev_reader = _iio.get_reader(all_segment_paths[-1])
+                    _prev_frames_list = [f for f in _prev_reader]
+                    _prev_reader.close()
+                    _prev_tensor = torch.from_numpy(np.stack(_prev_frames_list[-10:])).float() / 255.0
+                    _seg_overlap = compute_adaptive_overlap(
+                        _prev_tensor, ADAPTIVE_OVERLAP_MIN, ADAPTIVE_OVERLAP_MAX)
+                    print(f"   Adaptive overlap: {_seg_overlap} frames")
+                except Exception as e:
+                    print(f"   ⚠️  Adaptive overlap failed ({e})")
+
+            # Motion coherence: optical flow & camera LoRA auto-selection
+            if USE_MOTION_COHERENCE and len(all_segment_paths) > 0:
+                try:
+                    import imageio as _iio
+                    _prev_reader = _iio.get_reader(all_segment_paths[-1])
+                    _prev_frames_list = [f for f in _prev_reader]
+                    _prev_reader.close()
+                    if len(_prev_frames_list) >= 2:
+                        _f1 = _prev_frames_list[-2]
+                        _f2 = _prev_frames_list[-1]
+                        _flow = estimate_optical_flow(_f1, _f2)
+                        _direction = detect_motion_direction(_flow)
+                        _cam_lora = auto_select_camera_lora(_direction)
+                        if _cam_lora != "none":
+                            print(f"   Motion coherence: {_direction} -> camera={_cam_lora}")
+                            _seg_lora_stack = _build_lora_stack(
+                                IC_LORA, IC_LORA_STRENGTH, _cam_lora, CAMERA_LORA_STRENGTH)
+                except Exception as e:
+                    print(f"   ⚠️  Motion coherence failed ({e})")
+
+        # Determine segment frame count (audio sync or fixed)
+        _seg_frames = segment_lengths[seg_idx] if seg_idx < len(segment_lengths) else segment_length
+
         # Generate this segment using generate_pro
+        _seg_kwargs = dict(kwargs)
+        if _seg_lora_stack is not None:
+            _seg_kwargs["lora_stack"] = _seg_lora_stack
+        if _reference_histogram is not None and USE_COLOR_MATCHING:
+            _seg_kwargs["reference_histogram"] = _reference_histogram
+            _seg_kwargs["use_color_matching"] = True
+        if _timeline_entries is not None:
+            _seg_kwargs["timeline_entries"] = _timeline_entries
+        if _embedding_bank is not None:
+            _seg_kwargs["embedding_bank"] = _embedding_bank
+
         seg_output = generate_pro(
             user_input=user_input,
             image_path=current_anchor_path,
@@ -3452,7 +3622,7 @@ def generate_extended_video(
             negative_prompt=negative_prompt,
             width=width,
             height=height,
-            frames=segment_length,
+            frames=_seg_frames,
             fps=fps,
             seed=seeds[seg_idx],
             image_strength=image_strength if seg_idx == 0 else character_strength,
@@ -3462,12 +3632,59 @@ def generate_extended_video(
             character_name=character_name,
             character_description=character_description,
             output_prefix=f"{output_prefix}_seg{seg_num:02d}",
-            **kwargs,
+            **_seg_kwargs,
         )
         
         if seg_output is None:
             print(f"   ❌ Segment {seg_num} failed — stopping extension.")
             break
+
+        # ── Quality gate with retry (FEAT-003) ────────────────────────────
+        if USE_QUALITY_GATE and seg_output:
+            try:
+                import imageio as _iio
+                _reader = _iio.get_reader(seg_output)
+                _seg_frames_list = [f for f in _reader]
+                _reader.close()
+                _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
+                _quality = compute_segment_quality(_seg_tensor)
+                if not _quality.get("passed", True):
+                    print(f"   ⚠️  Quality gate failed for segment {seg_num}")
+                    for _retry in range(QUALITY_GATE_MAX_RETRIES - 1):
+                        _retry_seed = seeds[seg_idx] + _retry + 1
+                        print(f"   Retrying with seed={_retry_seed}...")
+                        seg_output = generate_pro(
+                            user_input=user_input,
+                            image_path=current_anchor_path,
+                            frames=_seg_frames,
+                            seed=_retry_seed,
+                            output_prefix=f"{output_prefix}_seg{seg_num:02d}_r{_retry+1}",
+                            **_seg_kwargs,
+                        )
+                        if seg_output:
+                            _reader = _iio.get_reader(seg_output)
+                            _seg_frames_list = [f for f in _reader]
+                            _reader.close()
+                            _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
+                            _quality = compute_segment_quality(_seg_tensor)
+                            if _quality.get("passed", True):
+                                print(f"   ✓ Quality gate passed on retry {_retry+1}")
+                                break
+            except Exception as e:
+                print(f"   ⚠️  Quality gate check failed ({e})")
+
+        # ── Extract reference color histogram from first segment (FEAT-003) ─
+        if seg_idx == 0 and USE_COLOR_MATCHING and seg_output:
+            try:
+                import imageio as _iio
+                _reader = _iio.get_reader(seg_output)
+                _seg_frames_list = [f for f in _reader]
+                _reader.close()
+                _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
+                _reference_histogram = extract_color_histogram(_seg_tensor)
+                print(f"   ✓ Reference color histogram extracted from segment 1")
+            except Exception as e:
+                print(f"   ⚠️  Reference histogram extraction failed ({e})")
         
         # Cache the segment
         shutil.copy(seg_output, cached_path)
@@ -3543,7 +3760,26 @@ def generate_extended_video(
     # Display if enabled
     if SHOW_PREVIEWS:
         display_video(final_path)
-    
+
+    # ── Export timeline (FEAT-003) ────────────────────────────────────────
+    if EXPORT_TIMELINE and _timeline_entries:
+        try:
+            _tl_path = f"/content/ComfyUI/output/{output_prefix}_timeline.{TIMELINE_FORMAT}"
+            if TIMELINE_FORMAT == "edl":
+                generate_edl(_timeline_entries, _tl_path, fps)
+            else:
+                generate_timeline_json(_timeline_entries, _tl_path)
+            print(f"   ✓ Timeline exported: {_tl_path}")
+        except Exception as e:
+            print(f"   ⚠️  Timeline export failed ({e})")
+
+    # ── Google Drive final sync (FEAT-003) ────────────────────────────────
+    if PERSIST_TO_GDRIVE and final_path:
+        try:
+            sync_to_drive(final_path, GDRIVE_PATH)
+        except Exception as e:
+            print(f"   ⚠️  Final Drive sync failed ({e})")
+
     return final_path
 
 
@@ -3666,6 +3902,47 @@ def run_storyboard(
     if start_index > 0:
         print(f"   \u23e9 Resuming from scene {start_index + 1} (found {start_index} cached clips)")
 
+    # ── Parallel Prompt Expansion (FEAT-003) ──────────────────────────────
+    expanded_prompts = {}
+    if USE_PARALLEL_PROMPT_EXPANSION and not BYPASS_EASY_PROMPT:
+        print("   📝 Parallel prompt expansion (loading LLM once for all scenes)...")
+        try:
+            for idx, scene in enumerate(scenes):
+                _inp = scene.get("user_input", "")
+                if _inp.strip():
+                    _pos, _neg = run_easy_prompt(
+                        user_input=_inp,
+                        frame_count=scene.get("frames", FRAMES),
+                        seed=scene.get("seed", SEED),
+                        scene_context=scene.get("character_description", ""),
+                    )
+                    expanded_prompts[idx] = (_pos, _neg)
+            print(f"   ✓ Expanded {len(expanded_prompts)} prompts in batch")
+            # Cache to disk for resume
+            _cache_path = f"{cache_dir}/expanded_prompts.json"
+            with open(_cache_path, "w") as f:
+                json.dump({str(k): v for k, v in expanded_prompts.items()}, f)
+        except Exception as e:
+            print(f"   ⚠️  Parallel expansion failed ({e}) - will expand per-scene")
+            expanded_prompts = {}
+
+    # ── Thumbnail Preview (FEAT-003) ──────────────────────────────────────
+    if GENERATE_THUMBNAILS:
+        print("   🖼️  Generating thumbnail previews...")
+        _thumbnails = []
+        for idx, scene in enumerate(scenes):
+            _thumb = generate_thumbnail_frame(
+                prompt=scene.get("user_input", ""),
+                width=scene.get("width", WIDTH),
+                height=scene.get("height", HEIGHT),
+                seed=scene.get("seed", SEED),
+            )
+            if _thumb:
+                _thumbnails.append(_thumb)
+        if _thumbnails:
+            display_thumbnail_grid(_thumbnails, THUMBNAIL_COLS)
+            print(f"   ✓ Thumbnail grid displayed ({len(_thumbnails)} scenes)")
+
     # ── Auto-reduce frames for stability ──────────────────────────────────
     if auto_reduce_for_stability and len(scenes) > 3:
         print(f"   \u2699\ufe0f  Auto-stability: capping frames to 97 for multi-scene mode ({len(scenes)} scenes)")
@@ -3732,6 +4009,11 @@ def run_storyboard(
                 )
                 if _retry_tiled_vae is not None:
                     _gen_kwargs["use_tiled_vae"] = _retry_tiled_vae
+                # Use pre-expanded prompt if available (FEAT-003)
+                if i in expanded_prompts:
+                    _gen_kwargs["positive_prompt"] = expanded_prompts[i][0]
+                    _gen_kwargs["negative_prompt"] = expanded_prompts[i][1]
+                    _gen_kwargs["bypass_easy_prompt"] = True
                 out = generate_pro(**_gen_kwargs)
                 # Cache successful clip
                 if out:
@@ -3846,6 +4128,33 @@ print("   Edit SCENES list above, then set USE_STORYBOARD=True in Cell 9.")
 _current_seed = SEED
 
 try:
+    # ── Script Intelligence: decompose script into SCENES (FEAT-003) ──────
+    if USE_SCRIPT_DECOMPOSER and SCRIPT_INPUT and SCRIPT_INPUT.strip():
+        print("📜 Script Decomposer active - breaking script into shots...")
+        try:
+            _script_scenes = []
+            _sentences = [s.strip() for s in SCRIPT_INPUT.replace(".", ".\n").split("\n") if s.strip()]
+            for idx, sentence in enumerate(_sentences):
+                _scene_dict = {
+                    "user_input": sentence,
+                    "image_path": CHARACTER_IMAGE_PATH if idx == 0 else None,
+                    "frames": FRAMES,
+                    "seed": SEED + idx,
+                    "output_prefix": f"Script{idx+1:02d}-{CHARACTER_NAME}",
+                    "character_image_path": CHARACTER_IMAGE_PATH,
+                    "character_mode": CHARACTER_CONSISTENCY_MODE,
+                }
+                if AUTO_CAMERA_SELECT:
+                    _cam = auto_select_camera_lora(sentence)
+                    if _cam != "none":
+                        _scene_dict["camera_lora"] = _cam
+                _script_scenes.append(_scene_dict)
+            SCENES = _script_scenes
+            USE_STORYBOARD = True
+            print(f"   ✓ Decomposed into {len(SCENES)} shots")
+        except Exception as e:
+            print(f"   ⚠️  Script decomposition failed ({e}) - using manual SCENES")
+
     if USE_STORYBOARD:
         # ── Multi-scene storyboard mode ───────────────────────────────────
         print("🎬 Running storyboard mode…")
@@ -3953,6 +4262,44 @@ try:
             SEED = _current_seed + 1
             print(f"🔢 Next seed: {SEED}")
 
+    # ── Export timeline if enabled (FEAT-003) ─────────────────────────────
+    if EXPORT_TIMELINE:
+        print("📋 Exporting timeline...")
+        try:
+            _tl_entries = []
+            # Build from output paths
+            if USE_STORYBOARD and 'storyboard_outputs' in dir():
+                for idx, out_path in enumerate(storyboard_outputs):
+                    if out_path:
+                        _tl_entries.append({
+                            "segment_index": idx,
+                            "output_path": out_path,
+                            "seed": SCENES[idx].get("seed", SEED + idx) if idx < len(SCENES) else SEED,
+                            "prompt": SCENES[idx].get("user_input", "")[:200] if idx < len(SCENES) else "",
+                            "frames": SCENES[idx].get("frames", FRAMES) if idx < len(SCENES) else FRAMES,
+                            "fps": FPS,
+                            "duration_seconds": (SCENES[idx].get("frames", FRAMES) if idx < len(SCENES) else FRAMES) / FPS,
+                        })
+            elif output:
+                _tl_entries.append({
+                    "segment_index": 0,
+                    "output_path": output,
+                    "seed": _current_seed,
+                    "prompt": USER_INPUT[:200],
+                    "frames": FRAMES,
+                    "fps": FPS,
+                    "duration_seconds": FRAMES / FPS,
+                })
+            if _tl_entries:
+                _tl_path = f"/content/ComfyUI/output/{OUTPUT_PREFIX}_timeline.{TIMELINE_FORMAT}"
+                if TIMELINE_FORMAT == "edl":
+                    generate_edl(_tl_entries, _tl_path, FPS)
+                else:
+                    generate_timeline_json(_tl_entries, _tl_path)
+                print(f"   ✓ Timeline: {_tl_path}")
+        except Exception as e:
+            print(f"   ⚠️  Timeline export failed ({e})")
+
 except KeyboardInterrupt:
     print("\n⚠️  Interrupted — partial output may be in /content/ComfyUI/output/")
 
@@ -4004,3 +4351,91 @@ except Exception as e:
     print("   Persistent deformation (3× same) → change USER_INPUT / POSITIVE_PROMPT")
     print("   Character drift                  → try CHARACTER_CONSISTENCY_MODE='both'")
     print("                                      or increase CHARACTER_STRENGTH")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELL 10  ─  EXPORT & POST-PROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# @title  { "single-column": true }
+# @markdown ## 💥 10. Export & Post-Processing
+# @markdown Run after generation to export timeline, apply additional grading,
+# @markdown or sync outputs to Google Drive.
+# @markdown
+# @markdown This cell is optional - features here also run automatically
+# @markdown when enabled in Cells 5-6 during generation.
+
+# ── Manual Google Drive mount & sync ──────────────────────────────────────────
+if PERSIST_TO_GDRIVE:
+    print("📁 Google Drive Sync...")
+    _drive_mounted = mount_google_drive()
+    if _drive_mounted:
+        # Sync all outputs from this session
+        _output_dir = "/content/ComfyUI/output"
+        if os.path.exists(_output_dir):
+            _files_synced = 0
+            for _f in os.listdir(_output_dir):
+                if _f.startswith(OUTPUT_PREFIX) and _f.endswith((".mp4", ".json")):
+                    _src = os.path.join(_output_dir, _f)
+                    if sync_to_drive(_src, GDRIVE_PATH):
+                        _files_synced += 1
+            print(f"   ✓ Synced {_files_synced} files to {GDRIVE_PATH}")
+    else:
+        print("   ⚠️  Google Drive not available")
+
+# ── Timeline export (manual trigger) ─────────────────────────────────────────
+if EXPORT_TIMELINE:
+    print("\n📋 Timeline Export...")
+    _tl_output = f"/content/ComfyUI/output/{OUTPUT_PREFIX}_timeline.{TIMELINE_FORMAT}"
+    if os.path.exists(_tl_output):
+        print(f"   ✓ Timeline already exists: {_tl_output}")
+        # Display summary
+        try:
+            with open(_tl_output, "r") as _f:
+                _tl_data = json.load(_f)
+            if isinstance(_tl_data, dict) and "segments" in _tl_data:
+                print(f"   Segments: {len(_tl_data['segments'])}")
+                print(f"   Total duration: {_tl_data.get('total_duration_seconds', 'N/A')}s")
+                for _seg in _tl_data["segments"][:5]:
+                    print(f"     [{_seg.get('segment_index', '?')}] "
+                          f"{_seg.get('duration_seconds', 0):.1f}s - "
+                          f"{_seg.get('prompt', '')[:50]}...")
+        except Exception:
+            pass
+        # Offer download
+        if DOWNLOAD_AFTER_GENERATE:
+            try:
+                files.download(_tl_output)
+            except Exception:
+                pass
+    else:
+        print(f"   ℹ️  No timeline found. Run generation with EXPORT_TIMELINE=True first.")
+
+# ── Color grade batch application ─────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Batch Post-Processing
+# @markdown Apply color grading to existing output files.
+
+BATCH_COLOR_GRADE_TARGET = ""  # @param {type:"string"}
+# Path to a video file to apply color grading to.
+# Leave empty to skip batch grading.
+
+if BATCH_COLOR_GRADE_TARGET and COLOR_GRADE != "none" and os.path.exists(BATCH_COLOR_GRADE_TARGET):
+    print(f"\n🎨 Applying {COLOR_GRADE} grade to: {BATCH_COLOR_GRADE_TARGET}")
+    try:
+        import imageio
+        _reader = imageio.get_reader(BATCH_COLOR_GRADE_TARGET)
+        _frames = [f for f in _reader]
+        _reader.close()
+        _tensor = torch.from_numpy(np.stack(_frames)).float() / 255.0
+        _graded = apply_color_grade(_tensor, COLOR_GRADE)
+        _graded_np = (_graded.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        _graded_path = BATCH_COLOR_GRADE_TARGET.replace(".mp4", f"_{COLOR_GRADE}.mp4")
+        imageio.mimsave(_graded_path, [f for f in _graded_np], fps=FPS, codec='libx264')
+        print(f"   ✓ Graded video saved: {_graded_path}")
+        if SHOW_PREVIEWS:
+            display_video(_graded_path)
+    except Exception as e:
+        print(f"   ⚠️  Batch grading failed ({e})")
+
+print("\n✅ Post-processing complete.")
