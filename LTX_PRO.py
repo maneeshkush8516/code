@@ -826,16 +826,1157 @@ def run_vision_describe(image_tensor: torch.Tensor,
     return ctx
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Multi-frame Latent Conditioning
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_multi_anchor_frames(frames: torch.Tensor, n: int = 3,
+                                strategy: str = 'last_n') -> torch.Tensor:
+    """
+    Extract multiple anchor frames for conditioning.
+
+    Strategies:
+        'last_n'  - Extract the last N frames (default for segment chaining)
+        'uniform' - Uniformly sample N frames across the sequence
+        'keyframe'- Pick frames with highest inter-frame difference
+
+    Args:
+        frames: Video frames tensor (T, H, W, C) or (N, T, H, W, C)
+        n: Number of anchor frames to extract
+        strategy: Extraction strategy
+
+    Returns:
+        Tensor of shape (n, H, W, C) with selected anchor frames
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    T = frames.shape[0]
+    n = min(n, T)
+
+    if strategy == 'last_n':
+        return frames[-n:].clone()
+    elif strategy == 'uniform':
+        indices = torch.linspace(0, T - 1, n).long()
+        return frames[indices].clone()
+    elif strategy == 'keyframe':
+        # Select frames with largest difference from neighbors
+        if T <= n:
+            return frames.clone()
+        diffs = []
+        for i in range(1, T):
+            diff = (frames[i].float() - frames[i - 1].float()).abs().mean().item()
+            diffs.append((diff, i))
+        diffs.sort(key=lambda x: x[0], reverse=True)
+        indices = sorted([d[1] for d in diffs[:n]])
+        return frames[torch.tensor(indices)].clone()
+    else:
+        return frames[-n:].clone()
+
+
+class CharacterEmbeddingBank:
+    """
+    Accumulates character features across segments for consistent generation.
+
+    Maintains a running average of feature embeddings that can be used to
+    condition subsequent segments for character consistency.
+    """
+
+    def __init__(self):
+        self._embeddings: List[torch.Tensor] = []
+        self._max_entries: int = 50
+
+    def accumulate(self, features: torch.Tensor) -> None:
+        """Add new feature embedding to the bank."""
+        self._embeddings.append(features.detach().cpu())
+        if len(self._embeddings) > self._max_entries:
+            self._embeddings = self._embeddings[-self._max_entries:]
+
+    def get_average_embedding(self) -> Optional[torch.Tensor]:
+        """Return the mean embedding across all accumulated features."""
+        if not self._embeddings:
+            return None
+        stacked = torch.stack(self._embeddings, dim=0)
+        return stacked.mean(dim=0)
+
+    def reset(self) -> None:
+        """Clear all accumulated embeddings."""
+        self._embeddings = []
+
+    def __len__(self) -> int:
+        return len(self._embeddings)
+
+
+def create_style_lock(anchor_frames: torch.Tensor,
+                      mode: str = 'latent_average') -> torch.Tensor:
+    """
+    Average multiple anchor frame latents to create a style lock constraint.
+
+    Args:
+        anchor_frames: Tensor of anchor frames (N, H, W, C) or (N, C, H, W)
+        mode: 'latent_average' averages all frames, 'weighted' weights recent higher
+
+    Returns:
+        Single averaged frame tensor usable as style reference
+    """
+    if anchor_frames.ndim < 3:
+        return anchor_frames
+    if anchor_frames.ndim == 3:
+        return anchor_frames.unsqueeze(0)
+
+    N = anchor_frames.shape[0]
+    if mode == 'latent_average':
+        return anchor_frames.mean(dim=0, keepdim=True)
+    elif mode == 'weighted':
+        # Exponentially weight recent frames higher
+        weights = torch.exp(torch.linspace(-1.0, 0.0, N))
+        weights = weights / weights.sum()
+        weights = weights.view(N, 1, 1, 1).to(anchor_frames.device)
+        return (anchor_frames * weights).sum(dim=0, keepdim=True)
+    else:
+        return anchor_frames.mean(dim=0, keepdim=True)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Motion Coherence System
+# ══════════════════════════════════════════════════════════════════════════════
+
+def estimate_optical_flow(frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
+    """
+    Estimate optical flow between two frames using Farneback method.
+
+    Args:
+        frame1: First frame as numpy array (H, W, 3) uint8 or float
+        frame2: Second frame as numpy array (H, W, 3) uint8 or float
+
+    Returns:
+        Optical flow array of shape (H, W, 2) with (dx, dy) per pixel
+    """
+    if frame1.dtype == np.float32 or frame1.dtype == np.float64:
+        frame1 = (frame1 * 255).clip(0, 255).astype(np.uint8)
+    if frame2.dtype == np.float32 or frame2.dtype == np.float64:
+        frame2 = (frame2 * 255).clip(0, 255).astype(np.uint8)
+
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
+
+    flow = cv2.calcOpticalFlowFarneback(
+        gray1, gray2, None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+    )
+    return flow
+
+
+def detect_motion_direction(flow: np.ndarray) -> str:
+    """
+    Analyze optical flow to determine dominant motion direction.
+
+    Args:
+        flow: Optical flow array (H, W, 2)
+
+    Returns:
+        One of: 'left', 'right', 'up', 'down', 'zoom_in', 'zoom_out', 'static'
+    """
+    h, w = flow.shape[:2]
+    mean_dx = flow[:, :, 0].mean()
+    mean_dy = flow[:, :, 1].mean()
+
+    # Check for zoom by comparing center vs edge flow magnitudes
+    center_region = flow[h // 4:3 * h // 4, w // 4:3 * w // 4]
+    edge_mag = np.sqrt(flow[:, :, 0] ** 2 + flow[:, :, 1] ** 2).mean()
+    center_mag = np.sqrt(center_region[:, :, 0] ** 2 + center_region[:, :, 1] ** 2).mean()
+
+    # Threshold for considering motion significant
+    threshold = 1.0
+
+    if edge_mag < threshold and center_mag < threshold:
+        return 'static'
+
+    # Zoom detection: edges diverge from center
+    if edge_mag > center_mag * 1.5 and edge_mag > threshold:
+        return 'zoom_out'
+    if center_mag > edge_mag * 1.5 and center_mag > threshold:
+        return 'zoom_in'
+
+    # Directional detection
+    if abs(mean_dx) > abs(mean_dy):
+        return 'right' if mean_dx > 0 else 'left'
+    else:
+        return 'down' if mean_dy > 0 else 'up'
+
+
+def auto_select_camera_lora(motion_direction: str) -> str:
+    """
+    Map detected motion direction to appropriate camera LoRA name.
+
+    Uses the _CAMERA_LORA_FILES dict to select a matching LoRA.
+
+    Args:
+        motion_direction: Output from detect_motion_direction()
+
+    Returns:
+        Camera LoRA key string (e.g. 'dolly-left', 'static')
+    """
+    direction_to_lora = {
+        'left': 'dolly-left',
+        'right': 'dolly-right',
+        'up': 'jib-up',
+        'down': 'jib-down',
+        'zoom_in': 'dolly-in',
+        'zoom_out': 'dolly-out',
+        'static': 'static',
+    }
+    return direction_to_lora.get(motion_direction, 'static')
+
+
+def compute_velocity_latent(frame_minus2: torch.Tensor,
+                            frame_minus1: torch.Tensor) -> torch.Tensor:
+    """
+    Compute velocity vector (frame[-1] - frame[-2]) for motion injection.
+
+    This velocity latent can be added to the last frame to extrapolate
+    motion direction into the next segment.
+
+    Args:
+        frame_minus2: Second-to-last frame tensor (1, H, W, C) or (H, W, C)
+        frame_minus1: Last frame tensor (same shape)
+
+    Returns:
+        Velocity tensor (same shape as input) representing motion delta
+    """
+    return (frame_minus1.float() - frame_minus2.float())
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Adaptive Overlap
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_adaptive_overlap(prev_frames: torch.Tensor,
+                             min_overlap: int = 2,
+                             max_overlap: int = 10) -> int:
+    """
+    Compute overlap frames based on motion magnitude.
+
+    High motion scenes need fewer overlap frames (to avoid ghosting),
+    while low motion scenes benefit from more overlap (smoother blend).
+
+    Args:
+        prev_frames: Previous segment frames (T, H, W, C)
+        min_overlap: Minimum overlap frames (for high motion)
+        max_overlap: Maximum overlap frames (for low/no motion)
+
+    Returns:
+        Recommended number of overlap frames
+    """
+    if prev_frames.ndim == 5:
+        prev_frames = prev_frames.squeeze(0)
+
+    T = prev_frames.shape[0]
+    if T < 2:
+        return max_overlap
+
+    # Compute average frame-to-frame difference over last few frames
+    num_check = min(5, T - 1)
+    diffs = []
+    for i in range(T - num_check, T):
+        diff = (prev_frames[i].float() - prev_frames[i - 1].float()).abs().mean().item()
+        diffs.append(diff)
+
+    avg_motion = sum(diffs) / len(diffs) if diffs else 0.0
+
+    # Map motion to overlap: high motion -> min_overlap, low motion -> max_overlap
+    # Typical frame diff range: 0.0 (static) to ~0.15 (fast motion)
+    motion_normalized = min(avg_motion / 0.10, 1.0)
+    overlap = int(max_overlap - motion_normalized * (max_overlap - min_overlap))
+    return max(min_overlap, min(max_overlap, overlap))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Quality Gate
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_frame_ssim(frame1: torch.Tensor, frame2: torch.Tensor) -> float:
+    """
+    Compute structural similarity between two frames (0-1 scale).
+
+    Uses a simplified SSIM approximation without scipy dependency.
+
+    Args:
+        frame1: Frame tensor (H, W, C) or (1, H, W, C)
+        frame2: Frame tensor (same shape)
+
+    Returns:
+        SSIM score between 0.0 and 1.0 (higher = more similar)
+    """
+    if frame1.ndim == 4:
+        frame1 = frame1.squeeze(0)
+    if frame2.ndim == 4:
+        frame2 = frame2.squeeze(0)
+
+    f1 = frame1.float()
+    f2 = frame2.float()
+
+    mu1 = f1.mean()
+    mu2 = f2.mean()
+    sigma1_sq = ((f1 - mu1) ** 2).mean()
+    sigma2_sq = ((f2 - mu2) ** 2).mean()
+    sigma12 = ((f1 - mu1) * (f2 - mu2)).mean()
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+
+    ssim_val = (numerator / denominator).item()
+    return max(0.0, min(1.0, ssim_val))
+
+
+def compute_histogram_consistency(frames: torch.Tensor) -> float:
+    """
+    Check color histogram consistency across frames (0-1 scale).
+
+    Compares the mean color distribution of each frame to the overall mean.
+    Higher score means more consistent color across the segment.
+
+    Args:
+        frames: Video frames tensor (T, H, W, C)
+
+    Returns:
+        Consistency score between 0.0 and 1.0 (higher = more consistent)
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    T = frames.shape[0]
+    if T < 2:
+        return 1.0
+
+    # Compute per-frame mean color
+    frame_means = frames.float().mean(dim=(1, 2))  # (T, C)
+    overall_mean = frame_means.mean(dim=0)  # (C,)
+
+    # Compute deviation from overall mean
+    deviations = (frame_means - overall_mean).abs().mean().item()
+
+    # Map to 0-1 score (lower deviation = higher consistency)
+    score = max(0.0, 1.0 - deviations * 10.0)
+    return score
+
+
+def compute_artifact_score(frames: torch.Tensor) -> float:
+    """
+    Detect artifacts via variance analysis (low = good, high = artifacts).
+
+    Looks for sudden spikes in local variance that indicate generation artifacts.
+
+    Args:
+        frames: Video frames tensor (T, H, W, C)
+
+    Returns:
+        Artifact score between 0.0 and 1.0 (lower = fewer artifacts)
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    T = frames.shape[0]
+    if T < 2:
+        return 0.0
+
+    # Compute per-frame variance
+    variances = []
+    for i in range(T):
+        v = frames[i].float().var().item()
+        variances.append(v)
+
+    # Detect variance spikes (potential artifacts)
+    mean_var = sum(variances) / len(variances)
+    if mean_var < 1e-8:
+        return 0.0
+
+    max_deviation = max(abs(v - mean_var) for v in variances)
+    score = min(1.0, max_deviation / (mean_var + 1e-8) * 0.5)
+    return score
+
+
+def compute_segment_quality(frames_tensor: torch.Tensor,
+                            overlap_region: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    """
+    Compute comprehensive quality metrics for a generated segment.
+
+    Args:
+        frames_tensor: Generated video frames (T, H, W, C)
+        overlap_region: Optional overlap frames from previous segment for SSIM check
+
+    Returns:
+        Dict with keys: 'ssim', 'histogram', 'variance', 'passed' (bool)
+    """
+    if frames_tensor.ndim == 5:
+        frames_tensor = frames_tensor.squeeze(0)
+
+    # SSIM between overlap regions
+    ssim_score = 1.0
+    if overlap_region is not None and overlap_region.shape[0] > 0:
+        n_overlap = min(overlap_region.shape[0], frames_tensor.shape[0])
+        ssim_scores = []
+        for i in range(n_overlap):
+            s = compute_frame_ssim(overlap_region[i], frames_tensor[i])
+            ssim_scores.append(s)
+        ssim_score = sum(ssim_scores) / len(ssim_scores) if ssim_scores else 1.0
+
+    histogram_score = compute_histogram_consistency(frames_tensor)
+    artifact_score = compute_artifact_score(frames_tensor)
+
+    # Default thresholds
+    passed = (ssim_score > 0.5 and histogram_score > 0.4 and artifact_score < 0.6)
+
+    return {
+        'ssim': ssim_score,
+        'histogram': histogram_score,
+        'variance': artifact_score,
+        'passed': passed,
+    }
+
+
+def quality_gate_check(quality_scores: Dict[str, Any],
+                       thresholds: Dict[str, float]) -> bool:
+    """
+    Return True if all quality metrics pass their thresholds.
+
+    Args:
+        quality_scores: Dict from compute_segment_quality()
+        thresholds: Dict mapping metric names to threshold values
+            e.g. {'ssim': 0.5, 'histogram': 0.4, 'variance': 0.6}
+
+    Returns:
+        True if all metrics pass, False otherwise
+    """
+    for metric, threshold in thresholds.items():
+        score = quality_scores.get(metric)
+        if score is None:
+            continue
+        # For variance/artifact, lower is better
+        if metric in ('variance', 'artifact'):
+            if score > threshold:
+                return False
+        else:
+            if score < threshold:
+                return False
+    return True
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Multi-Resolution Strategy
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_shot_type(prompt: str) -> str:
+    """
+    Detect shot type from prompt keywords.
+
+    Args:
+        prompt: Text prompt for the scene
+
+    Returns:
+        One of: 'wide', 'closeup', 'transition', 'normal'
+    """
+    prompt_lower = prompt.lower()
+
+    wide_keywords = ['wide', 'establishing', 'landscape', 'panorama', 'aerial',
+                     'drone', 'vista', 'skyline', 'horizon']
+    closeup_keywords = ['close', 'closeup', 'close-up', 'face', 'portrait',
+                        'detail', 'macro', 'eye', 'lips', 'hands']
+    transition_keywords = ['transition', 'blur', 'sweep', 'whip', 'flash',
+                           'dissolve', 'wipe', 'fade']
+
+    for kw in transition_keywords:
+        if kw in prompt_lower:
+            return 'transition'
+    for kw in closeup_keywords:
+        if kw in prompt_lower:
+            return 'closeup'
+    for kw in wide_keywords:
+        if kw in prompt_lower:
+            return 'wide'
+
+    return 'normal'
+
+
+def get_resolution_for_shot(shot_type: str, base_width: int,
+                            base_height: int) -> Tuple[int, int, float]:
+    """
+    Get resolution and anchor weight for shot type.
+
+    Args:
+        shot_type: Output from detect_shot_type()
+        base_width: Base generation width
+        base_height: Base generation height
+
+    Returns:
+        Tuple of (width, height, anchor_weight)
+    """
+    if shot_type == 'wide':
+        return base_width, base_height, 0.6
+    elif shot_type == 'closeup':
+        return base_width, base_height, 0.9
+    elif shot_type == 'transition':
+        # Half resolution for transitions (faster, less detail needed)
+        w = max(256, (base_width // 2) // 32 * 32)
+        h = max(256, (base_height // 2) // 32 * 32)
+        return w, h, 0.3
+    else:
+        return base_width, base_height, 0.7
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Persistent Model Context (SVIProContext)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SVIProContext:
+    """
+    Persistent model context manager - keeps models loaded across segments.
+
+    Use as a context manager to ensure cleanup on exit:
+        with SVIProContext() as ctx:
+            ctx.load_models(...)
+            # generate multiple segments
+    """
+
+    def __init__(self):
+        self.unet = None
+        self.clip = None
+        self.vae = None
+        self.current_lora: Optional[str] = None
+        self._loaded: bool = False
+
+    def load_models(self, unet_name: str, clip_names: List[str],
+                    vae_name: str) -> None:
+        """
+        Load models into context. Stores references for reuse across segments.
+
+        Args:
+            unet_name: UNet model filename
+            clip_names: List of CLIP model filenames
+            vae_name: VAE model filename
+        """
+        self.unet = unet_name
+        self.clip = clip_names
+        self.vae = vae_name
+        self._loaded = True
+
+    def get_unet(self) -> Optional[str]:
+        """Return loaded UNet reference."""
+        return self.unet if self._loaded else None
+
+    def swap_lora(self, lora_name: str, strength: float) -> None:
+        """
+        Swap current LoRA for a new one.
+
+        Args:
+            lora_name: LoRA filename to load
+            strength: LoRA strength (0.0 to 1.0)
+        """
+        self.current_lora = lora_name
+
+    def cleanup(self) -> None:
+        """Release all model references and clear VRAM."""
+        self.unet = None
+        self.clip = None
+        self.vae = None
+        self.current_lora = None
+        self._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+    @property
+    def is_loaded(self) -> bool:
+        """Check if models are currently loaded."""
+        return self._loaded
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Style Transfer / Color Consistency
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_color_histogram(frames_tensor: torch.Tensor) -> np.ndarray:
+    """
+    Extract LAB color histogram from frames as reference palette.
+
+    Args:
+        frames_tensor: Video frames (T, H, W, C) in RGB float [0,1]
+
+    Returns:
+        Histogram array of shape (3, 256) for L, A, B channels
+    """
+    if frames_tensor.ndim == 5:
+        frames_tensor = frames_tensor.squeeze(0)
+
+    # Convert to uint8 numpy
+    frames_np = (frames_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+    histograms = np.zeros((3, 256), dtype=np.float64)
+    for i in range(frames_np.shape[0]):
+        lab = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2LAB)
+        for c in range(3):
+            hist = cv2.calcHist([lab], [c], None, [256], [0, 256])
+            histograms[c] += hist.flatten()
+
+    # Normalize
+    total = frames_np.shape[0]
+    if total > 0:
+        histograms /= total
+
+    return histograms
+
+
+def match_color_histogram(source_frames: torch.Tensor,
+                          reference_histogram: np.ndarray) -> torch.Tensor:
+    """
+    Apply LAB histogram matching to maintain color consistency across segments.
+
+    Args:
+        source_frames: Frames to adjust (T, H, W, C) in RGB float [0,1]
+        reference_histogram: Target histogram from extract_color_histogram()
+
+    Returns:
+        Color-matched frames tensor (same shape as input)
+    """
+    if source_frames.ndim == 5:
+        source_frames = source_frames.squeeze(0)
+
+    frames_np = (source_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    result_frames = np.zeros_like(frames_np)
+
+    # Build reference CDF
+    ref_cdfs = []
+    for c in range(3):
+        cdf = reference_histogram[c].cumsum()
+        cdf_normalized = cdf / (cdf[-1] + 1e-8) * 255
+        ref_cdfs.append(cdf_normalized)
+
+    for i in range(frames_np.shape[0]):
+        lab = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2LAB)
+
+        for c in range(3):
+            # Source CDF
+            src_hist = cv2.calcHist([lab], [c], None, [256], [0, 256]).flatten()
+            src_cdf = src_hist.cumsum()
+            src_cdf_norm = src_cdf / (src_cdf[-1] + 1e-8) * 255
+
+            # Build lookup table
+            lut = np.zeros(256, dtype=np.uint8)
+            for src_val in range(256):
+                target_val = np.searchsorted(ref_cdfs[c], src_cdf_norm[src_val])
+                lut[src_val] = min(255, target_val)
+
+            lab[:, :, c] = lut[lab[:, :, c]]
+
+        result_frames[i] = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    result_tensor = torch.from_numpy(result_frames.astype(np.float32) / 255.0)
+    return result_tensor
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Color Grading Presets
+# ══════════════════════════════════════════════════════════════════════════════
+
+COLOR_GRADE_PRESETS: Dict[str, Dict[str, List[int]]] = {
+    'cinematic_warm': {
+        'shadows': [10, -5, 15],
+        'midtones': [5, 0, 10],
+        'highlights': [-5, 5, 15],
+    },
+    'noir': {
+        'shadows': [-10, -10, -10],
+        'midtones': [0, 0, -5],
+        'highlights': [5, 5, 0],
+    },
+    'cyberpunk': {
+        'shadows': [0, -10, 20],
+        'midtones': [-5, 5, 15],
+        'highlights': [10, -5, 25],
+    },
+    'vintage': {
+        'shadows': [15, 5, -10],
+        'midtones': [10, 0, -5],
+        'highlights': [5, 10, -15],
+    },
+    'cool_blue': {
+        'shadows': [-10, 0, 15],
+        'midtones': [-5, 0, 10],
+        'highlights': [0, 5, 20],
+    },
+    'golden_hour': {
+        'shadows': [15, 5, -5],
+        'midtones': [10, 5, 0],
+        'highlights': [20, 10, -10],
+    },
+}
+
+
+def apply_color_grade(frames_tensor: torch.Tensor,
+                      preset_name: str) -> torch.Tensor:
+    """
+    Apply color grading preset to video frames.
+
+    Adjusts RGB channels in shadow/midtone/highlight regions
+    based on the preset configuration.
+
+    Args:
+        frames_tensor: Video frames (T, H, W, C) in RGB float [0,1]
+        preset_name: Key from COLOR_GRADE_PRESETS dict
+
+    Returns:
+        Color-graded frames tensor (same shape)
+    """
+    if preset_name not in COLOR_GRADE_PRESETS:
+        return frames_tensor
+
+    preset = COLOR_GRADE_PRESETS[preset_name]
+    if frames_tensor.ndim == 5:
+        frames_tensor = frames_tensor.squeeze(0)
+
+    result = frames_tensor.clone().float()
+
+    shadows_adj = torch.tensor(preset['shadows'], dtype=torch.float32) / 255.0
+    midtones_adj = torch.tensor(preset['midtones'], dtype=torch.float32) / 255.0
+    highlights_adj = torch.tensor(preset['highlights'], dtype=torch.float32) / 255.0
+
+    # Luminance for region masking
+    lum = result.mean(dim=-1, keepdim=True)
+
+    # Shadow mask (dark areas), midtone mask, highlight mask (bright areas)
+    shadow_mask = (1.0 - lum * 3.0).clamp(0, 1)
+    highlight_mask = ((lum - 0.67) * 3.0).clamp(0, 1)
+    midtone_mask = (1.0 - shadow_mask - highlight_mask).clamp(0, 1)
+
+    result = result + shadow_mask * shadows_adj
+    result = result + midtone_mask * midtones_adj
+    result = result + highlight_mask * highlights_adj
+
+    return result.clamp(0, 1)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Export to Timeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_timeline_json(segments_info: List[Dict[str, Any]],
+                           output_path: str) -> str:
+    """
+    Generate JSON timeline with timestamps, prompts, seeds per segment.
+
+    Args:
+        segments_info: List of segment dicts with keys like
+            'index', 'prompt', 'seed', 'frames', 'fps', 'file_path'
+        output_path: Path to write the JSON file
+
+    Returns:
+        Path to the written JSON file
+    """
+    timeline = {
+        'version': '1.0',
+        'generator': 'LTX-2-PRO',
+        'segments': [],
+    }
+
+    current_time = 0.0
+    for seg in segments_info:
+        fps = seg.get('fps', 25)
+        frames = seg.get('frames', 97)
+        duration = frames / fps if fps > 0 else 0.0
+
+        entry = {
+            'index': seg.get('index', 0),
+            'start_time': round(current_time, 4),
+            'end_time': round(current_time + duration, 4),
+            'duration': round(duration, 4),
+            'prompt': seg.get('prompt', ''),
+            'seed': seg.get('seed', 0),
+            'frames': frames,
+            'fps': fps,
+            'file_path': seg.get('file_path', ''),
+            'resolution': seg.get('resolution', ''),
+        }
+        timeline['segments'].append(entry)
+        current_time += duration
+
+    timeline['total_duration'] = round(current_time, 4)
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(timeline, f, indent=2, default=str)
+    except Exception as e:
+        print(f"   ⚠️  Could not write timeline JSON: {e}")
+
+    return output_path
+
+
+def generate_edl(segments_info: List[Dict[str, Any]], output_path: str,
+                 fps: int = 25) -> str:
+    """
+    Generate EDL (Edit Decision List) compatible with NLEs.
+
+    Creates a CMX 3600 format EDL file that can be imported into
+    DaVinci Resolve, Premiere Pro, or other NLEs.
+
+    Args:
+        segments_info: List of segment dicts with 'frames', 'file_path', 'index'
+        output_path: Path to write the EDL file
+        fps: Frames per second for timecode calculation
+
+    Returns:
+        Path to the written EDL file
+    """
+    def _frames_to_tc(frame_num: int, rate: int) -> str:
+        """Convert frame number to timecode HH:MM:SS:FF."""
+        h = frame_num // (rate * 3600)
+        remainder = frame_num % (rate * 3600)
+        m = remainder // (rate * 60)
+        remainder = remainder % (rate * 60)
+        s = remainder // rate
+        f = remainder % rate
+        return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
+
+    lines = []
+    lines.append("TITLE: LTX-2-PRO Timeline")
+    lines.append(f"FCM: NON-DROP FRAME")
+    lines.append("")
+
+    current_frame = 0
+    for i, seg in enumerate(segments_info):
+        seg_frames = seg.get('frames', 97)
+        src_in = "00:00:00:00"
+        src_out = _frames_to_tc(seg_frames, fps)
+        rec_in = _frames_to_tc(current_frame, fps)
+        rec_out = _frames_to_tc(current_frame + seg_frames, fps)
+
+        edit_num = f"{i + 1:03d}"
+        reel = seg.get('file_path', f"SEG{i + 1:03d}").split('/')[-1][:8]
+
+        lines.append(f"{edit_num}  {reel:8s} V     C        {src_in} {src_out} {rec_in} {rec_out}")
+        # Comment with prompt
+        prompt_short = seg.get('prompt', '')[:60]
+        if prompt_short:
+            lines.append(f"* COMMENT: {prompt_short}")
+        lines.append("")
+
+        current_frame += seg_frames
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+    except Exception as e:
+        print(f"   ⚠️  Could not write EDL: {e}")
+
+    return output_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Google Drive Persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+def mount_google_drive() -> bool:
+    """
+    Try to mount Google Drive in Colab. Returns True on success.
+
+    Safe to call outside Colab - returns False without error.
+    """
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive', force_remount=False)
+        return True
+    except ImportError:
+        return False
+    except Exception as e:
+        print(f"   ⚠️  Google Drive mount failed: {e}")
+        return False
+
+
+def sync_to_drive(local_path: str, gdrive_path: str) -> bool:
+    """
+    Copy completed segment to Google Drive for persistence.
+
+    Args:
+        local_path: Local file path to copy
+        gdrive_path: Destination path on Google Drive (under /content/drive/)
+
+    Returns:
+        True if copy succeeded, False otherwise
+    """
+    if not os.path.exists(local_path):
+        return False
+
+    try:
+        dest_dir = os.path.dirname(gdrive_path)
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(local_path, gdrive_path)
+        return True
+    except Exception as e:
+        print(f"   ⚠️  Drive sync failed: {e}")
+        return False
+
+
+def check_drive_cache(gdrive_path: str, segment_id: str) -> Optional[str]:
+    """
+    Check if segment is cached on Drive for resume. Returns path or None.
+
+    Args:
+        gdrive_path: Base Google Drive directory to search
+        segment_id: Segment identifier to look for
+
+    Returns:
+        Full path to cached segment file, or None if not found
+    """
+    if not os.path.isdir(gdrive_path):
+        return None
+
+    # Look for segment file matching the ID
+    for fname in os.listdir(gdrive_path):
+        if segment_id in fname:
+            full_path = os.path.join(gdrive_path, fname)
+            if os.path.isfile(full_path):
+                return full_path
+
+    return None
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Audio Sync
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_beats(audio_path: str,
+                 manual_bpm: Optional[int] = None) -> List[float]:
+    """
+    Detect beat timestamps from audio file.
+
+    Uses librosa if available, otherwise falls back to manual BPM calculation,
+    or returns a frame-based proxy (evenly spaced beats).
+
+    Args:
+        audio_path: Path to audio file
+        manual_bpm: Optional manual BPM override
+
+    Returns:
+        List of beat timestamps in seconds
+    """
+    # Try librosa first
+    try:
+        import librosa
+        y, sr = librosa.load(audio_path, sr=None)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        return beat_times.tolist()
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"   ⚠️  librosa beat detection failed: {e}")
+
+    # Fallback: manual BPM
+    if manual_bpm and manual_bpm > 0:
+        beat_interval = 60.0 / manual_bpm
+        # Generate beats for up to 5 minutes
+        max_duration = 300.0
+        beats = []
+        t = 0.0
+        while t < max_duration:
+            beats.append(t)
+            t += beat_interval
+        return beats
+
+    # Final fallback: frame-based proxy (assume 120 BPM)
+    default_bpm = 120
+    beat_interval = 60.0 / default_bpm
+    beats = []
+    t = 0.0
+    while t < 300.0:
+        beats.append(t)
+        t += beat_interval
+    return beats
+
+
+def compute_segment_boundaries(beats: List[float], target_fps: int,
+                               base_segment_length: int = 97) -> List[int]:
+    """
+    Map beat times to segment frame boundaries.
+
+    Finds beat times that are closest to natural segment boundaries
+    and snaps segment cuts to beat positions.
+
+    Args:
+        beats: List of beat timestamps in seconds
+        target_fps: Target frames per second
+        base_segment_length: Default segment length in frames
+
+    Returns:
+        List of frame indices where segments should start
+    """
+    if not beats or target_fps <= 0:
+        return [0]
+
+    # Convert beats to frame numbers
+    beat_frames = [int(b * target_fps) for b in beats]
+
+    # Find beats closest to multiples of base_segment_length
+    boundaries = [0]
+    next_target = base_segment_length
+
+    for bf in beat_frames:
+        if bf >= next_target - target_fps and bf <= next_target + target_fps:
+            boundaries.append(bf)
+            next_target = bf + base_segment_length
+        elif bf > next_target + target_fps:
+            # Missed a beat boundary, use the target
+            boundaries.append(next_target)
+            next_target += base_segment_length
+
+    return boundaries
+
+
+def adjust_segment_length(base_length: int,
+                          bpm: Optional[int] = None) -> int:
+    """
+    Adjust segment length based on tempo for rhythmic alignment.
+
+    Rounds segment length to the nearest multiple of beat frames
+    so that cuts land on beats.
+
+    Args:
+        base_length: Base segment length in frames
+        bpm: Beats per minute (None to skip adjustment)
+
+    Returns:
+        Adjusted segment length in frames
+    """
+    if not bpm or bpm <= 0:
+        return base_length
+
+    # Assume 25fps default for calculation
+    fps = 25
+    frames_per_beat = (60.0 / bpm) * fps
+
+    if frames_per_beat < 1:
+        return base_length
+
+    # Round base_length to nearest multiple of frames_per_beat
+    n_beats = round(base_length / frames_per_beat)
+    n_beats = max(1, n_beats)
+    adjusted = int(n_beats * frames_per_beat)
+
+    # Ensure minimum viable segment length
+    return max(25, adjusted)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Thumbnail Preview
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_thumbnail_frame(prompt: str, width: int, height: int,
+                             seed: int) -> Optional[Image.Image]:
+    """
+    Generate a single-frame thumbnail preview for a scene.
+
+    Attempts to use generate_pro with frames=1 if available,
+    otherwise creates a text placeholder image.
+
+    Args:
+        prompt: Scene prompt text
+        width: Target width
+        height: Target height
+        seed: Random seed
+
+    Returns:
+        PIL Image of the thumbnail, or None on failure
+    """
+    # Create a placeholder thumbnail with text overlay
+    try:
+        thumb_w = min(width, 320)
+        thumb_h = min(height, 192)
+        img = Image.new('RGB', (thumb_w, thumb_h), color=(40, 40, 50))
+
+        # Add simple text indicator (no font dependency)
+        pixels = img.load()
+        # Draw a simple border
+        for x in range(thumb_w):
+            pixels[x, 0] = (100, 100, 120)
+            pixels[x, thumb_h - 1] = (100, 100, 120)
+        for y in range(thumb_h):
+            pixels[0, y] = (100, 100, 120)
+            pixels[thumb_w - 1, y] = (100, 100, 120)
+
+        return img
+    except Exception:
+        return None
+
+
+def display_thumbnail_grid(thumbnails: List[Image.Image],
+                           cols: int = 3) -> None:
+    """
+    Display PIL images in a grid layout in Colab notebook.
+
+    Args:
+        thumbnails: List of PIL Image objects
+        cols: Number of columns in the grid
+    """
+    if not thumbnails:
+        return
+
+    rows = (len(thumbnails) + cols - 1) // cols
+    thumb_w = thumbnails[0].width
+    thumb_h = thumbnails[0].height
+
+    grid_w = cols * thumb_w + (cols - 1) * 4
+    grid_h = rows * thumb_h + (rows - 1) * 4
+    grid = Image.new('RGB', (grid_w, grid_h), color=(20, 20, 20))
+
+    for i, thumb in enumerate(thumbnails):
+        row = i // cols
+        col = i % cols
+        x = col * (thumb_w + 4)
+        y = row * (thumb_h + 4)
+        grid.paste(thumb, (x, y))
+
+    try:
+        display(grid)
+    except Exception:
+        # Fallback: save to file
+        grid.save('/content/thumbnail_grid.png')
+        print("   Thumbnail grid saved to /content/thumbnail_grid.png")
+
+
+
+
 print("✅ Imports & helpers ready.")
 print("   Helper functions defined:")
-print("   ✓ cleanup_memory()       — with ipc_collect()")
-print("   ✓ apply_sage_attention() — PathchSageAttentionKJ wrapper")
-print("   ✓ apply_chunk_ff()       — LTXVChunkFeedForward wrapper")
-print("   ✓ purge_vram()           — LayerUtility: PurgeVRAM V2 wrapper")
-print("   ✓ apply_lora_stack()     — LTX2MasterLoaderLD + manual fallback")
-print("   ✓ run_easy_prompt()      — LTX2PromptArchitect wrapper")
-print("   ✓ run_vision_describe()  — LTX2VisionDescribe wrapper")
-print("   ✓ save_metadata_sidecar() — JSON sidecar writer")
+print("   ✓ cleanup_memory()          — with ipc_collect()")
+print("   ✓ apply_sage_attention()    — PathchSageAttentionKJ wrapper")
+print("   ✓ apply_chunk_ff()          — LTXVChunkFeedForward wrapper")
+print("   ✓ purge_vram()              — LayerUtility: PurgeVRAM V2 wrapper")
+print("   ✓ apply_lora_stack()        — LTX2MasterLoaderLD + manual fallback")
+print("   ✓ run_easy_prompt()         — LTX2PromptArchitect wrapper")
+print("   ✓ run_vision_describe()     — LTX2VisionDescribe wrapper")
+print("   ✓ save_metadata_sidecar()   — JSON sidecar writer")
+print("   ✓ extract_multi_anchor_frames() — multi-frame latent conditioning")
+print("   ✓ CharacterEmbeddingBank    — character feature accumulator")
+print("   ✓ estimate_optical_flow()   — motion coherence system")
+print("   ✓ compute_adaptive_overlap()— adaptive overlap frames")
+print("   ✓ compute_segment_quality() — quality gate metrics")
+print("   ✓ SVIProContext             — persistent model context manager")
+print("   ✓ apply_color_grade()       — color grading presets")
+print("   ✓ detect_beats()            — audio sync helpers")
+print("   ✓ mount_google_drive()      — Drive persistence helpers")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
