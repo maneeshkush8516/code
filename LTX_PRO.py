@@ -2032,6 +2032,42 @@ print(f"   Show previews: {SHOW_PREVIEWS}  |  Auto-download: {DOWNLOAD_AFTER_GEN
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CELL 4.5  ─  SCRIPT-TO-SHOT DECOMPOSER (Script Intelligence)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# @title  { "single-column": true }
+# @markdown ## 💥 4.5. Script-to-Shot Intelligence
+# @markdown Takes a full narrative script and decomposes it into per-segment
+# @markdown prompts using LTX2PromptArchitect. Each shot gets action, camera
+# @markdown motion, and lighting continuity notes. Outputs SCENES list for
+# @markdown the storyboard runner.
+
+USE_SCRIPT_DECOMPOSER = False  # @param {type:"boolean"}
+# When True, SCRIPT_INPUT is decomposed into a SCENES list automatically.
+
+SCRIPT_INPUT = ""  # @param {type:"string"}
+# Full narrative script text. Example:
+# "A detective enters a smoky bar. She scans the room. A man in a trench coat
+#  catches her eye. She approaches his table. They exchange tense words."
+
+SCRIPT_LLM_MODEL = "8B"  # @param ["8B", "3B", "14B"]
+# LLM model for script decomposition (same as Easy Prompt LLM choices).
+
+AUTO_CAMERA_SELECT = True  # @param {type:"boolean"}
+# Auto-select camera LoRA per shot based on narrative beats.
+# e.g. "enters" -> dolly-in, "scans" -> dolly-left/right, "approaches" -> dolly-in
+
+SHOTS_PER_SCENE = 3  # @param {type:"integer"}
+# Target number of shots to decompose each scene description into.
+
+print("✅ Script Intelligence configured.")
+print(f"   Decomposer: {'ACTIVE' if USE_SCRIPT_DECOMPOSER else 'disabled'}")
+print(f"   Script LLM: {SCRIPT_LLM_MODEL}  |  Auto-camera: {AUTO_CAMERA_SELECT}")
+if SCRIPT_INPUT:
+    print(f"   Script preview: {SCRIPT_INPUT[:80]}...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CELL 5  ─  CHARACTER CONSISTENCY & LORA CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2151,6 +2187,71 @@ SEGMENT_SEED_MODE = "fixed"   # @param ["fixed", "increment", "random"]
 print(f"   Overlap      : {OVERLAP_FRAMES} frames ({OVERLAP_MODE}, side={OVERLAP_SIDE})")
 print(f"   Seg Extension: {USE_SEGMENT_EXTENSION}  |  {SEGMENT_LENGTH} frames x {MAX_SEGMENTS} segments")
 
+# ── Advanced Generation Features ─────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Advanced Features (Temporal / Motion / Quality)
+
+MULTI_FRAME_ANCHOR_COUNT = 3    # @param {type:"integer"}
+# Number of frames from previous segment used as conditioning anchor.
+# More frames = stronger temporal consistency but slightly slower.
+
+USE_CHARACTER_EMBEDDING_BANK = False  # @param {type:"boolean"}
+# Accumulate character features across segments for consistency.
+# Uses CharacterEmbeddingBank class to average features over time.
+
+USE_STYLE_LOCK = False   # @param {type:"boolean"}
+# Lock visual style by averaging multiple anchor frame latents.
+# Creates a "style constraint" that prevents drift across segments.
+
+USE_MOTION_COHERENCE = False  # @param {type:"boolean"}
+# Enable optical flow estimation between segments for smooth motion.
+# Auto-selects camera LoRA based on detected motion direction.
+
+USE_VELOCITY_INJECTION = False  # @param {type:"boolean"}
+# Inject velocity vector (frame[-2] - frame[-1]) into initial noise.
+# Maintains motion momentum between segments.
+
+USE_ADAPTIVE_OVERLAP = False  # @param {type:"boolean"}
+# Replace fixed OVERLAP_FRAMES with adaptive computation.
+# High motion = fewer overlap frames, low motion = more overlap frames.
+
+ADAPTIVE_OVERLAP_MIN = 2   # @param {type:"integer"}
+# Minimum overlap frames (used for high-motion transitions).
+
+ADAPTIVE_OVERLAP_MAX = 10  # @param {type:"integer"}
+# Maximum overlap frames (used for slow/static scenes).
+
+USE_QUALITY_GATE = False  # @param {type:"boolean"}
+# Auto-reject segments with poor quality metrics.
+# Regenerates with seed+1 up to QUALITY_GATE_MAX_RETRIES times.
+
+QUALITY_GATE_MAX_RETRIES = 3  # @param {type:"integer"}
+# Maximum regeneration attempts when quality gate fails.
+
+SSIM_THRESHOLD = 0.7    # @param {type:"number"}
+# Minimum SSIM score in overlap region (0-1, higher = stricter).
+
+HISTOGRAM_THRESHOLD = 0.8  # @param {type:"number"}
+# Minimum color histogram consistency (0-1, higher = stricter).
+
+VARIANCE_THRESHOLD = 0.1   # @param {type:"number"}
+# Maximum variance threshold for artifact detection (lower = stricter).
+
+USE_MULTI_RESOLUTION = False  # @param {type:"boolean"}
+# Detect shot type from prompt and adjust resolution accordingly.
+# Wide shots = full res, transitions = half res + upscale, closeups = full + strong anchor.
+
+USE_PERSISTENT_CONTEXT = False  # @param {type:"boolean"}
+# Keep models loaded across segments in generate_extended_video.
+# Saves 30-40% time by avoiding repeated load/unload cycles.
+# Only swaps LoRAs when camera direction changes.
+
+print(f"   Multi-frame  : {MULTI_FRAME_ANCHOR_COUNT} anchor frames  |  Embedding bank: {USE_CHARACTER_EMBEDDING_BANK}")
+print(f"   Motion       : coherence={USE_MOTION_COHERENCE}  |  velocity={USE_VELOCITY_INJECTION}")
+print(f"   Adaptive OL  : {USE_ADAPTIVE_OVERLAP}  (range: {ADAPTIVE_OVERLAP_MIN}-{ADAPTIVE_OVERLAP_MAX})")
+print(f"   Quality gate : {USE_QUALITY_GATE}  |  retries={QUALITY_GATE_MAX_RETRIES}")
+print(f"   Multi-res    : {USE_MULTI_RESOLUTION}  |  Persistent ctx: {USE_PERSISTENT_CONTEXT}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CELL 6  ─  VIDEO GENERATION CONFIGURATION
@@ -2249,6 +2350,83 @@ print(f"   Pass 2     : {PASS2_SAMPLER}  |  {PASS2_SIGMAS}")
 print(f"   Pro Mode   : {PRO_MODE}  |  steps={PRO_STEPS}, scheduler={PRO_SCHEDULER}, split@{PRO_SPLIT_AT}")
 print(f"   Overlap    : {OVERLAP_FRAMES} frames ({OVERLAP_MODE}, side={OVERLAP_SIDE})")
 print(f"   Seg Extend : {USE_SEGMENT_EXTENSION}  |  {SEGMENT_LENGTH} frames x {MAX_SEGMENTS} segments")
+
+# ── Audio Sync ────────────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Audio-Synced Generation
+
+USE_AUDIO_SYNC = False     # @param {type:"boolean"}
+# Sync segment boundaries to detected audio beats.
+# Adjusts SEGMENT_LENGTH dynamically based on tempo.
+
+AUDIO_SYNC_PATH = None     # @param {type:"string"}
+# Path to audio file for beat detection.
+# e.g. "/content/drive/MyDrive/music.mp3"
+
+AUDIO_BPM = None           # @param {type:"integer"}
+# Manual BPM fallback if beat detection fails.
+# e.g. 120 for typical pop/rock, 60-80 for ambient, 140+ for EDM.
+
+# ── Thumbnail Preview ─────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Thumbnail Storyboard Preview
+
+GENERATE_THUMBNAILS = False  # @param {type:"boolean"}
+# Generate 1-frame thumbnail per scene before full generation.
+# Displays grid preview so you can check composition before committing.
+
+THUMBNAIL_COLS = 3          # @param {type:"integer"}
+# Number of columns in thumbnail grid display.
+
+# ── Style & Color ─────────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Color Consistency & Grading
+
+USE_COLOR_MATCHING = False  # @param {type:"boolean"}
+# Extract color histogram from first segment as reference palette.
+# Apply LAB color matching to all subsequent segments.
+
+COLOR_GRADE = "none"        # @param ["none", "cinematic_warm", "noir", "cyberpunk", "vintage", "cool_blue", "golden_hour"]
+# Apply color grading preset in post-processing to all frames.
+# "none" = no grading applied.
+
+# ── Google Drive Persistence ──────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Google Drive Sync
+
+PERSIST_TO_GDRIVE = False   # @param {type:"boolean"}
+# Auto-sync completed segments to Google Drive after each generation.
+# Enables resume if Colab disconnects.
+
+GDRIVE_PATH = "/content/drive/MyDrive/LTX_PRO_Output"  # @param {type:"string"}
+# Google Drive folder for syncing generated videos and segments.
+
+# ── Export & Timeline ─────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Export to Timeline
+
+EXPORT_TIMELINE = False     # @param {type:"boolean"}
+# Generate EDL or JSON timeline alongside video output.
+# Includes timestamps, prompts, seeds for each segment.
+
+TIMELINE_FORMAT = "json"    # @param ["json", "edl"]
+# "json" = JSON timeline (re-importable, easy to parse)
+# "edl"  = EDL (Edit Decision List, compatible with NLEs like DaVinci/Premiere)
+
+# ── Parallel Prompt Expansion ─────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Performance Optimization
+
+USE_PARALLEL_PROMPT_EXPANSION = False  # @param {type:"boolean"}
+# In storyboard mode, expand ALL prompts in one batch before video generation.
+# Avoids loading/unloading LLM N times. Caches expanded prompts to disk.
+
+print(f"   Audio sync   : {USE_AUDIO_SYNC}  |  path={AUDIO_SYNC_PATH}  |  BPM={AUDIO_BPM}")
+print(f"   Thumbnails   : {GENERATE_THUMBNAILS}  |  cols={THUMBNAIL_COLS}")
+print(f"   Color match  : {USE_COLOR_MATCHING}  |  grade={COLOR_GRADE}")
+print(f"   Drive sync   : {PERSIST_TO_GDRIVE}  |  path={GDRIVE_PATH}")
+print(f"   Timeline     : {EXPORT_TIMELINE}  |  format={TIMELINE_FORMAT}")
+print(f"   Parallel exp : {USE_PARALLEL_PROMPT_EXPANSION}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
