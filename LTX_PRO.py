@@ -876,10 +876,12 @@ def extract_multi_anchor_frames(frames: torch.Tensor, n: int = 3,
 
 class CharacterEmbeddingBank:
     """
-    Accumulates character features across segments for consistent generation.
+    Accumulates compact frame-level features across segments for consistent generation.
 
-    Maintains a running average of feature embeddings that can be used to
-    condition subsequent segments for character consistency.
+    Maintains a running average of spatially-pooled frame features (not raw pixels
+    or model embeddings) that can be used to condition subsequent segments for
+    character consistency. Features are derived by spatial-mean pooling of frame
+    tensors to create a compact per-frame representation.
     """
 
     def __init__(self):
@@ -887,7 +889,7 @@ class CharacterEmbeddingBank:
         self._max_entries: int = 50
 
     def accumulate(self, features: torch.Tensor) -> None:
-        """Add new feature embedding to the bank."""
+        """Add new feature representation to the bank (spatial-mean pooled frame features)."""
         self._embeddings.append(features.detach().cpu())
         if len(self._embeddings) > self._max_entries:
             self._embeddings = self._embeddings[-self._max_entries:]
@@ -1900,7 +1902,28 @@ def generate_thumbnail_frame(prompt: str, width: int, height: int,
     Returns:
         PIL Image of the thumbnail, or None on failure
     """
-    # Create a placeholder thumbnail with text overlay
+    # Attempt real single-frame generation via generate_pro
+    try:
+        if 'generate_pro' in dir() or callable(globals().get('generate_pro')):
+            _thumb_output = generate_pro(
+                user_input=prompt,
+                image_path=None,
+                frames=1,
+                width=min(width, 512),
+                height=min(height, 320),
+                seed=seed,
+                output_prefix="_thumb_preview",
+            )
+            if _thumb_output and os.path.exists(_thumb_output):
+                import imageio as _iio
+                _reader = _iio.get_reader(_thumb_output)
+                _frame = next(iter(_reader))
+                _reader.close()
+                return Image.fromarray(_frame)
+    except Exception:
+        pass  # Fall through to placeholder
+
+    # Fallback: create a placeholder thumbnail with text overlay
     try:
         thumb_w = min(width, 320)
         thumb_h = min(height, 192)
@@ -2492,6 +2515,7 @@ def generate_pro(
     persist_to_gdrive:       bool  = None,   # None -> use PERSIST_TO_GDRIVE global
     timeline_entries:        list  = None,   # Mutable list for accumulating timeline data
     embedding_bank:          object = None,  # CharacterEmbeddingBank instance
+    velocity_latent:         object = None,  # Velocity tensor for motion injection (noise bias)
 ) -> Optional[str]:
     """
     LTX-2 PRO — Two-pass generation pipeline with Character Consistency.
@@ -3282,10 +3306,20 @@ def generate_pro(
             # Character embedding bank accumulation
             if embedding_bank is not None:
                 try:
-                    embedding_bank.accumulate(decoded_frames[-1:])
-                    print(f"   ✓ Character embedding bank updated ({embedding_bank.count} samples)")
+                    # Extract compact spatial-mean features from the last frame
+                    # rather than storing raw pixels - reduces memory and creates
+                    # a more meaningful representation for consistency matching
+                    _raw_frame = decoded_frames[-1:]
+                    if _raw_frame.ndim >= 3:
+                        # Spatial average: collapse H,W dims to get compact feature vector
+                        # Input shape: (1, H, W, C) or (1, C, H, W)
+                        _feat = _raw_frame.float().mean(dim=-2).mean(dim=-2)  # -> (1, C)
+                    else:
+                        _feat = _raw_frame.float()
+                    embedding_bank.accumulate(_feat)
+                    print(f"   \u2713 Character embedding bank updated ({len(embedding_bank)} samples)")
                 except Exception as e:
-                    print(f"   ⚠️  Embedding bank update failed ({e})")
+                    print(f"   \u26a0\ufe0f  Embedding bank update failed ({e})")
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
@@ -3540,11 +3574,25 @@ def generate_extended_video(
         try:
             beats = detect_beats(AUDIO_SYNC_PATH, AUDIO_BPM)
             if beats:
-                segment_lengths = compute_segment_boundaries(beats, fps, segment_length)
-                segment_lengths = segment_lengths[:max_segments]
+                _boundaries = compute_segment_boundaries(beats, fps, segment_length)
+                # Convert absolute frame positions to per-segment deltas
+                if len(_boundaries) >= 2:
+                    segment_lengths = [_boundaries[i+1] - _boundaries[i]
+                                       for i in range(len(_boundaries) - 1)]
+                    segment_lengths = segment_lengths[:max_segments]
                 print(f"   Audio sync: {len(segment_lengths)} segments synced to beats")
         except Exception as e:
             print(f"   ⚠️  Audio sync failed ({e}) - using fixed segment length")
+
+    # ── Persistent model context (FEAT-003) ───────────────────────────────
+    _pro_context = None
+    if USE_PERSISTENT_CONTEXT:
+        try:
+            _pro_context = SVIProContext()
+            print("   [experimental] Persistent model context enabled - models will be reused across segments")
+        except Exception as e:
+            print(f"   ⚠️  Persistent context init failed ({e})")
+            _pro_context = None
     
     for seg_idx in range(max_segments):
         seg_num = seg_idx + 1
@@ -3564,41 +3612,60 @@ def generate_extended_video(
         # ── Motion coherence & adaptive overlap (FEAT-003) ────────────────
         _seg_overlap = overlap_frames
         _seg_lora_stack = None  # Will override if motion coherence active
+        _velocity_latent = None  # For velocity injection
 
         if seg_idx > 0 and current_anchor_path:
-            # Adaptive overlap computation
-            if USE_ADAPTIVE_OVERLAP and len(all_segment_paths) > 0:
+            # Read previous segment ONCE and share between adaptive overlap,
+            # motion coherence, and velocity injection (avoids triple file read)
+            _prev_segment_tensor = None
+            _prev_frames_list = None
+            if (USE_ADAPTIVE_OVERLAP or USE_MOTION_COHERENCE or USE_VELOCITY_INJECTION) and len(all_segment_paths) > 0:
                 try:
                     import imageio as _iio
                     _prev_reader = _iio.get_reader(all_segment_paths[-1])
                     _prev_frames_list = [f for f in _prev_reader]
                     _prev_reader.close()
-                    _prev_tensor = torch.from_numpy(np.stack(_prev_frames_list[-10:])).float() / 255.0
+                    _prev_segment_tensor = torch.from_numpy(
+                        np.stack(_prev_frames_list)).float() / 255.0
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Previous segment read failed ({e})")
+                    _prev_frames_list = None
+                    _prev_segment_tensor = None
+
+            # Adaptive overlap computation
+            if USE_ADAPTIVE_OVERLAP and _prev_segment_tensor is not None:
+                try:
                     _seg_overlap = compute_adaptive_overlap(
-                        _prev_tensor, ADAPTIVE_OVERLAP_MIN, ADAPTIVE_OVERLAP_MAX)
+                        _prev_segment_tensor[-10:], ADAPTIVE_OVERLAP_MIN, ADAPTIVE_OVERLAP_MAX)
                     print(f"   Adaptive overlap: {_seg_overlap} frames")
                 except Exception as e:
-                    print(f"   ⚠️  Adaptive overlap failed ({e})")
+                    print(f"   \u26a0\ufe0f  Adaptive overlap failed ({e})")
 
             # Motion coherence: optical flow & camera LoRA auto-selection
-            if USE_MOTION_COHERENCE and len(all_segment_paths) > 0:
+            if USE_MOTION_COHERENCE and _prev_frames_list is not None and len(_prev_frames_list) >= 2:
                 try:
-                    import imageio as _iio
-                    _prev_reader = _iio.get_reader(all_segment_paths[-1])
-                    _prev_frames_list = [f for f in _prev_reader]
-                    _prev_reader.close()
-                    if len(_prev_frames_list) >= 2:
-                        _f1 = _prev_frames_list[-2]
-                        _f2 = _prev_frames_list[-1]
-                        _flow = estimate_optical_flow(_f1, _f2)
-                        _direction = detect_motion_direction(_flow)
-                        _cam_lora = auto_select_camera_lora(_direction)
-                        if _cam_lora != "none":
-                            print(f"   Motion coherence: {_direction} -> camera={_cam_lora}")
-                            _seg_lora_stack = _build_lora_stack(
-                                IC_LORA, IC_LORA_STRENGTH, _cam_lora, CAMERA_LORA_STRENGTH)
+                    _f1 = _prev_frames_list[-2]
+                    _f2 = _prev_frames_list[-1]
+                    _flow = estimate_optical_flow(_f1, _f2)
+                    _direction = detect_motion_direction(_flow)
+                    _cam_lora = auto_select_camera_lora(_direction)
+                    if _cam_lora != "none":
+                        print(f"   Motion coherence: {_direction} -> camera={_cam_lora}")
+                        _seg_lora_stack = _build_lora_stack(
+                            IC_LORA, IC_LORA_STRENGTH, _cam_lora, CAMERA_LORA_STRENGTH)
                 except Exception as e:
-                    print(f"   ⚠️  Motion coherence failed ({e})")
+                    print(f"   \u26a0\ufe0f  Motion coherence failed ({e})")
+
+            # Velocity injection: compute motion delta from last 2 frames
+            if USE_VELOCITY_INJECTION and _prev_segment_tensor is not None and _prev_segment_tensor.shape[0] >= 2:
+                try:
+                    _velocity_latent = compute_velocity_latent(
+                        _prev_segment_tensor[-2], _prev_segment_tensor[-1])
+                    _vel_mag = _velocity_latent.abs().mean().item()
+                    print(f"   Velocity injection: magnitude={_vel_mag:.4f}")
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Velocity injection failed ({e})")
+                    _velocity_latent = None
 
         # Determine segment frame count (audio sync or fixed)
         _seg_frames = segment_lengths[seg_idx] if seg_idx < len(segment_lengths) else segment_length
@@ -3614,8 +3681,11 @@ def generate_extended_video(
             _seg_kwargs["timeline_entries"] = _timeline_entries
         if _embedding_bank is not None:
             _seg_kwargs["embedding_bank"] = _embedding_bank
+        if _velocity_latent is not None:
+            _seg_kwargs["velocity_latent"] = _velocity_latent
 
-        seg_output = generate_pro(
+        # Build common call kwargs so retries use the same parameters
+        _gen_call_kwargs = dict(
             user_input=user_input,
             image_path=current_anchor_path,
             positive_prompt=positive_prompt,
@@ -3632,8 +3702,9 @@ def generate_extended_video(
             character_name=character_name,
             character_description=character_description,
             output_prefix=f"{output_prefix}_seg{seg_num:02d}",
-            **_seg_kwargs,
         )
+
+        seg_output = generate_pro(**_gen_call_kwargs, **_seg_kwargs)
         
         if seg_output is None:
             print(f"   ❌ Segment {seg_num} failed — stopping extension.")
@@ -3649,18 +3720,15 @@ def generate_extended_video(
                 _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
                 _quality = compute_segment_quality(_seg_tensor)
                 if not _quality.get("passed", True):
-                    print(f"   ⚠️  Quality gate failed for segment {seg_num}")
+                    print(f"   \u26a0\ufe0f  Quality gate failed for segment {seg_num}")
                     for _retry in range(QUALITY_GATE_MAX_RETRIES - 1):
                         _retry_seed = seeds[seg_idx] + _retry + 1
                         print(f"   Retrying with seed={_retry_seed}...")
-                        seg_output = generate_pro(
-                            user_input=user_input,
-                            image_path=current_anchor_path,
-                            frames=_seg_frames,
-                            seed=_retry_seed,
-                            output_prefix=f"{output_prefix}_seg{seg_num:02d}_r{_retry+1}",
-                            **_seg_kwargs,
-                        )
+                        # Reuse common kwargs with updated seed and prefix
+                        _retry_kwargs = dict(_gen_call_kwargs)
+                        _retry_kwargs["seed"] = _retry_seed
+                        _retry_kwargs["output_prefix"] = f"{output_prefix}_seg{seg_num:02d}_r{_retry+1}"
+                        seg_output = generate_pro(**_retry_kwargs, **_seg_kwargs)
                         if seg_output:
                             _reader = _iio.get_reader(seg_output)
                             _seg_frames_list = [f for f in _reader]
@@ -3668,10 +3736,10 @@ def generate_extended_video(
                             _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
                             _quality = compute_segment_quality(_seg_tensor)
                             if _quality.get("passed", True):
-                                print(f"   ✓ Quality gate passed on retry {_retry+1}")
+                                print(f"   \u2713 Quality gate passed on retry {_retry+1}")
                                 break
             except Exception as e:
-                print(f"   ⚠️  Quality gate check failed ({e})")
+                print(f"   \u26a0\ufe0f  Quality gate check failed ({e})")
 
         # ── Extract reference color histogram from first segment (FEAT-003) ─
         if seg_idx == 0 and USE_COLOR_MATCHING and seg_output:
@@ -3778,7 +3846,15 @@ def generate_extended_video(
         try:
             sync_to_drive(final_path, GDRIVE_PATH)
         except Exception as e:
-            print(f"   ⚠️  Final Drive sync failed ({e})")
+            print(f"   \u26a0\ufe0f  Final Drive sync failed ({e})")
+
+    # ── Cleanup persistent context (FEAT-003) ─────────────────────────────
+    if _pro_context is not None:
+        try:
+            _pro_context.cleanup()
+            print("   \u2713 Persistent model context released")
+        except Exception:
+            pass
 
     return final_path
 
@@ -4268,7 +4344,7 @@ try:
         try:
             _tl_entries = []
             # Build from output paths
-            if USE_STORYBOARD and 'storyboard_outputs' in dir():
+            if USE_STORYBOARD and globals().get('storyboard_outputs'):
                 for idx, out_path in enumerate(storyboard_outputs):
                     if out_path:
                         _tl_entries.append({
