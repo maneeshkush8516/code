@@ -941,6 +941,103 @@ def create_style_lock(anchor_frames: torch.Tensor,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Dual-Anchor Continuity System
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_continuity_composite(video_path: str, n_frames: int = 5,
+                                 mode: str = 'weighted_average') -> Optional[torch.Tensor]:
+    """
+    Extract last N frames from a video and create a weighted composite tensor.
+
+    Used by the dual-anchor system to produce a high-quality continuity frame
+    that captures the temporal state at the end of a scene. A weighted composite
+    reduces noise/flicker artifacts compared to a single last frame.
+
+    Args:
+        video_path: Path to the source video file.
+        n_frames: Number of frames to extract from the end of the video.
+        mode: 'weighted_average' - later frames get linearly higher weight.
+              'last_frame'       - only return the very last frame (legacy).
+
+    Returns:
+        NHWC float tensor (1, H, W, 3) in [0,1] range, or None on failure.
+    """
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total == 0:
+            cap.release()
+            return None
+
+        n = min(n_frames, total)
+
+        if mode == 'last_frame' or n == 1:
+            # Legacy single-frame behavior
+            cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+            ok, frame = cap.read()
+            cap.release()
+            if not ok:
+                return None
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
+
+        # Extract last n frames
+        start_idx = total - n
+        frames_list = []
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+        for _ in range(n):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames_list.append(torch.from_numpy(frame).float() / 255.0)
+        cap.release()
+
+        if not frames_list:
+            return None
+
+        # weighted_average: linear weights (1, 2, 3, ..., n) normalized
+        n_actual = len(frames_list)
+        weights = torch.arange(1, n_actual + 1, dtype=torch.float32)
+        weights = weights / weights.sum()
+        # frames_list items are (H, W, 3); stack to (N, H, W, 3)
+        stacked = torch.stack(frames_list, dim=0)
+        # Apply weights along dim 0
+        weighted = (stacked * weights.view(-1, 1, 1, 1)).sum(dim=0)
+        return weighted.unsqueeze(0)  # (1, H, W, 3)
+    except Exception:
+        return None
+
+
+def save_continuity_frame(tensor: torch.Tensor, path: str, format: str = 'png') -> bool:
+    """
+    Save a frame tensor to disk as PNG or JPEG.
+
+    Args:
+        tensor: NHWC float tensor (1, H, W, 3) in [0,1] range.
+        path: Output file path.
+        format: 'png' for lossless, 'jpg' for compressed (quality=98).
+
+    Returns:
+        True if saved successfully, False otherwise.
+    """
+    try:
+        if tensor.ndim == 4:
+            tensor = tensor[0]
+        arr = (tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        pil_img = Image.fromarray(arr, "RGB")
+        if format.lower() in ('jpg', 'jpeg'):
+            pil_img.save(path, "JPEG", quality=98)
+        else:
+            pil_img.save(path, "PNG")
+        return True
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PRO HELPERS - Motion Coherence System
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2275,6 +2372,34 @@ print(f"   Adaptive OL  : {USE_ADAPTIVE_OVERLAP}  (range: {ADAPTIVE_OVERLAP_MIN}
 print(f"   Quality gate : {USE_QUALITY_GATE}  |  retries={QUALITY_GATE_MAX_RETRIES}")
 print(f"   Multi-res    : {USE_MULTI_RESOLUTION}  |  Persistent ctx: {USE_PERSISTENT_CONTEXT}")
 
+# ── Dual-Anchor Identity System ───────────────────────────────────────────────
+USE_DUAL_ANCHOR_STORYBOARD = True  # @param {type:"boolean"}
+# When True, storyboard mode uses BOTH the character reference image (identity)
+# AND the continuity frame from the previous scene (temporal) simultaneously.
+# This is the key fix for character identity drift across scenes.
+
+CONTINUITY_FRAME_FORMAT = "png"  # @param ["png", "jpg"]
+# Format for saving continuity frames between scenes.
+# PNG preserves full quality; JPEG loses detail at compression boundaries.
+
+CONTINUITY_MULTI_FRAME_COUNT = 5  # @param {type:"integer"}
+# Number of frames to extract from the end of a segment for the continuity composite.
+# More frames = more stable reference. Set to 1 for single-frame (legacy behavior).
+
+CONTINUITY_COMPOSITE_MODE = "weighted_average"  # @param ["weighted_average", "last_frame"]
+# How to combine multiple continuity frames:
+# "weighted_average" - later frames get higher weight (preserves recent appearance)
+# "last_frame"       - only use the very last frame (legacy behavior)
+
+LATENT_OVERLAP_STRENGTH = 0.3  # @param {type:"number"}
+# How strongly to blend the character anchor latent into the video latent.
+# 0.0 = no anchor influence, 1.0 = full anchor replacement.
+# Only active when character_mode="both" and both images are available.
+# Recommended: 0.2-0.4 for natural results with strong identity.
+
+print(f"   Dual-anchor  : {USE_DUAL_ANCHOR_STORYBOARD}  |  Continuity: {CONTINUITY_FRAME_FORMAT}")
+print(f"   Composite    : {CONTINUITY_COMPOSITE_MODE}  ({CONTINUITY_MULTI_FRAME_COUNT} frames)  |  Latent blend: {LATENT_OVERLAP_STRENGTH}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CELL 6  ─  VIDEO GENERATION CONFIGURATION
@@ -2840,13 +2965,39 @@ def generate_pro(
         print("\n🗂️  Preparing latents…")
         _print_vram()
 
-        # Determine input image for latent prep (I2V or T2V)
-        # For I2V: use image_path tensor. For anchor-only: use character image.
+        # ── Dual-Anchor Logic (FEAT: identity fix) ────────────────────────
+        # In "both" mode with TWO images available (continuity + character),
+        # use continuity frame for I2V (temporal bridge) and character image
+        # for anchor latent (identity preservation). This is the key fix for
+        # character drift across storyboard scenes.
         _ref_tensor = seed_image_tensor
-        if _ref_tensor is None and _char_mode in ("i2v", "both"):
+        _use_i2v = False
+
+        if _char_mode == "both" and seed_image_tensor is not None and char_image_tensor is not None:
+            # DUAL-ANCHOR: continuity frame -> I2V, character image -> anchor latent
+            # _ref_tensor already == seed_image_tensor (continuity frame for I2V)
+            _use_i2v = True
+            print(f"   \U0001f9ec Dual-anchor: continuity frame -> I2V | character image -> anchor latent")
+        elif _char_mode == "both" and seed_image_tensor is None and char_image_tensor is not None:
+            # Only character image available - use it for BOTH I2V and anchor
             _ref_tensor = char_image_tensor
-        _use_i2v = (_ref_tensor is not None and _char_mode in ("i2v", "both")) or \
-                   (_ref_tensor is not None and image_path is not None and _char_mode == "none")
+            _use_i2v = True
+        elif _char_mode == "i2v":
+            # I2V mode: prefer seed_image (continuity), fallback to character image
+            if seed_image_tensor is None and char_image_tensor is not None:
+                _ref_tensor = char_image_tensor
+            _use_i2v = (_ref_tensor is not None)
+        elif _char_mode == "anchor":
+            # Anchor-only: no I2V conditioning, character handled separately
+            _ref_tensor = None
+            _use_i2v = False
+        elif _char_mode == "none" and seed_image_tensor is not None:
+            # No character mode but have an explicit image_path - use for I2V
+            # _ref_tensor already == seed_image_tensor
+            _use_i2v = True
+        else:
+            _ref_tensor = None
+            _use_i2v = False
 
         # ── Compute half-resolution for Pass 1 latent ─────────────────────
         # [256] EmptyImage → [164] ResizeImageMaskNode ×0.5 → [163] GetImageSize
@@ -2979,26 +3130,58 @@ def generate_pro(
         _vid_lat_input = get_value_at_index(vid_lat, 0)
         if anchor_latent is not None:
             try:
-                # Use anchor_latent as the starting video latent for Pass 1.
-                # This biases the denoising toward the character's appearance.
-                # (The anchor replaces the empty latent — it is a valid LATENT dict.)
-                _vid_lat_input = anchor_latent
-                print(f"   ✓ Character anchor injected as video latent seed  (mode={_char_mode})")
-                print(f"     Note: LTX-2 has no WanImageToVideoSVIPro equivalent;")
-                print(f"     anchor is used as the initial latent for Pass 1 denoising.")
+                # ── Dual-Anchor Blend (FEAT: identity fix) ─────────────────────
+                # Instead of replacing the entire video latent with the anchor,
+                # BLEND the anchor into the first K frames of the video latent.
+                # This biases the opening frames toward character identity while
+                # preserving I2V continuity conditioning in the rest of the latent.
+                _anch_samples = anchor_latent.get("samples", None)
+                _vid_samples = _vid_lat_input.get("samples", None) if isinstance(_vid_lat_input, dict) else None
 
-                # Diagnostic: check tensor rank (LTX video VAE should produce T dim)
+                if _anch_samples is not None and _vid_samples is not None and \
+                   USE_DUAL_ANCHOR_STORYBOARD and _char_mode == "both":
+                    # Ensure anchor is 5D (N, C, T, H, W)
+                    if _anch_samples.ndim == 4:
+                        _anch_samples = _anch_samples.unsqueeze(2)  # (N, C, 1, H, W)
+
+                    # Determine K = number of frames to blend into
+                    _total_t = _vid_samples.shape[2] if _vid_samples.ndim == 5 else 1
+                    _K = min(OVERLAP_FRAMES, _total_t)
+
+                    # Repeat anchor across K frames
+                    _anchor_repeated = _anch_samples.repeat(1, 1, _K, 1, 1)
+
+                    # Spatial dimension check - only blend if shapes match
+                    if _vid_samples.ndim == 5 and _anchor_repeated.shape[3:] == _vid_samples[:, :, :_K, :, :].shape[3:]:
+                        _strength = float(LATENT_OVERLAP_STRENGTH)
+                        _vid_samples = _vid_samples.clone()
+                        _vid_samples[:, :, :_K, :, :] = (
+                            (1.0 - _strength) * _vid_samples[:, :, :_K, :, :] +
+                            _strength * _anchor_repeated
+                        )
+                        _vid_lat_input = {**_vid_lat_input, "samples": _vid_samples}
+                        print(f"   \u2713 Dual-anchor blend: {_strength:.0%} anchor into first {_K} frames  (mode={_char_mode})")
+                    else:
+                        # Shape mismatch - fall back to full replacement
+                        _vid_lat_input = anchor_latent
+                        print(f"   \u2713 Character anchor injected (full replace, shape mismatch)")
+                else:
+                    # Non-dual-anchor path: use anchor latent as the starting video latent
+                    # (original behavior for anchor-only mode or when flag is disabled)
+                    _vid_lat_input = anchor_latent
+                    print(f"   \u2713 Character anchor injected as video latent seed  (mode={_char_mode})")
+
+                # Diagnostic: check tensor rank
                 _anch_shape = anchor_latent.get("samples", torch.empty(0)).shape
                 print(f"     Anchor latent shape: {list(_anch_shape)}")
-                if len(_anch_shape) == 4:
+                if len(_anch_shape) == 4 and not (USE_DUAL_ANCHOR_STORYBOARD and _char_mode == "both"):
                     # Standard VAEEncode returns 4D (N, C, H, W); LTX needs 5D (N, C, T, H, W)
-                    # Unsqueeze temporal dimension (T=1) to make it a single-frame video latent
-                    print("     ⚠️  Anchor is 4D (image latent) — unsqueezing T dim for video latent.")
-                    _s = anchor_latent["samples"].unsqueeze(2)   # → (N, C, 1, H, W)
+                    print("     \u26a0\ufe0f  Anchor is 4D (image latent) - unsqueezing T dim for video latent.")
+                    _s = anchor_latent["samples"].unsqueeze(2)   # -> (N, C, 1, H, W)
                     _vid_lat_input = {**anchor_latent, "samples": _s}
                     print(f"     Anchor latent shape after fix: {list(_s.shape)}")
             except Exception as e:
-                print(f"   ⚠️  Anchor injection error ({e}) — using empty/I2V latent.")
+                print(f"   \u26a0\ufe0f  Anchor injection error ({e}) - using empty/I2V latent.")
                 _vid_lat_input = get_value_at_index(vid_lat, 0)
 
         # [199] LTXVEmptyLatentAudio - audio latent
@@ -4037,17 +4220,55 @@ def run_storyboard(
         # Resolve image_path: use continuity frame if available and not explicitly set
         _image_path = scene.get("image_path")
         if use_continuity and prev_output and _image_path is None:
-            print(f"   \U0001f517 Continuity: extracting last frame from scene {scene_num - 1}\u2026")
-            last_tensor = get_last_frame_tensor(prev_output)
-            if last_tensor is not None:
-                _cont_path = os.path.join(tmp_dir, f"_continuity_s{scene_num:02d}.jpg")
-                # Save last frame as JPEG for use as seed image
-                pil_frame = tensor_to_pil(last_tensor)
-                pil_frame.save(_cont_path, "JPEG", quality=95)
-                _image_path = _cont_path
-                print(f"   \u2713 Continuity frame saved: {_cont_path}")
-            else:
-                print(f"   \u26a0\ufe0f  Could not extract last frame \u2014 skipping continuity.")
+            print(f"   \U0001f517 Continuity: extracting frames from scene {scene_num - 1}\u2026")
+            try:
+                # Use multi-frame composite when configured (default)
+                _n_cont_frames = CONTINUITY_MULTI_FRAME_COUNT if CONTINUITY_MULTI_FRAME_COUNT > 1 else 1
+                _cont_mode = CONTINUITY_COMPOSITE_MODE
+                _cont_fmt = CONTINUITY_FRAME_FORMAT.lower()
+                _ext = "png" if _cont_fmt == "png" else "jpg"
+                _cont_path = os.path.join(tmp_dir, f"_continuity_s{scene_num:02d}.{_ext}")
+
+                # Extract composite from previous output
+                _cont_tensor = extract_continuity_composite(
+                    prev_output, n_frames=_n_cont_frames, mode=_cont_mode)
+
+                if _cont_tensor is not None:
+                    save_continuity_frame(_cont_tensor, _cont_path, format=_cont_fmt)
+                    _image_path = _cont_path
+                    print(f"   \u2713 Continuity composite saved ({_n_cont_frames} frames, {_cont_mode}): {_cont_path}")
+                else:
+                    # Fallback to single last frame (legacy)
+                    last_tensor = get_last_frame_tensor(prev_output)
+                    if last_tensor is not None:
+                        _cont_path = os.path.join(tmp_dir, f"_continuity_s{scene_num:02d}.{_ext}")
+                        save_continuity_frame(last_tensor, _cont_path, format=_cont_fmt)
+                        _image_path = _cont_path
+                        print(f"   \u2713 Continuity frame saved (fallback single): {_cont_path}")
+                    else:
+                        print(f"   \u26a0\ufe0f  Could not extract continuity frame - skipping.")
+            except Exception as _cont_err:
+                print(f"   \u26a0\ufe0f  Continuity extraction error ({_cont_err}) - trying legacy method.")
+                last_tensor = get_last_frame_tensor(prev_output)
+                if last_tensor is not None:
+                    _cont_path = os.path.join(tmp_dir, f"_continuity_s{scene_num:02d}.jpg")
+                    pil_frame = tensor_to_pil(last_tensor)
+                    pil_frame.save(_cont_path, "JPEG", quality=95)
+                    _image_path = _cont_path
+                else:
+                    print(f"   \u26a0\ufe0f  Could not extract last frame - skipping continuity.")
+
+            # ── Dual-Anchor auto-upgrade ──────────────────────────────
+            # When dual-anchor is enabled AND we have both a continuity frame
+            # AND the scene has a character image, force character_mode to "both"
+            # so the dual-anchor system fires for every scene after the first.
+            if USE_DUAL_ANCHOR_STORYBOARD and _image_path is not None:
+                _scene_char_img = scene.get("character_image_path", CHARACTER_IMAGE_PATH)
+                if _scene_char_img:
+                    _prev_mode = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE)
+                    scene["character_mode"] = "both"
+                    if _prev_mode != "both":
+                        print(f"   \U0001f9ec Dual-anchor activated: character_mode '{_prev_mode}' -> 'both'")
 
         # Determine frames (auto-reduce if needed)
         _frames = scene.get("frames", FRAMES)
