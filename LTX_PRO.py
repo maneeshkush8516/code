@@ -966,47 +966,47 @@ def extract_continuity_composite(video_path: str, n_frames: int = 5,
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return None
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total == 0:
-            cap.release()
-            return None
-
-        n = min(n_frames, total)
-
-        if mode == 'last_frame' or n == 1:
-            # Legacy single-frame behavior
-            cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
-            ok, frame = cap.read()
-            cap.release()
-            if not ok:
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total == 0:
                 return None
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
-        # Extract last n frames
-        start_idx = total - n
-        frames_list = []
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
-        for _ in range(n):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames_list.append(torch.from_numpy(frame).float() / 255.0)
-        cap.release()
+            n = min(n_frames, total)
 
-        if not frames_list:
-            return None
+            if mode == 'last_frame' or n == 1:
+                # Legacy single-frame behavior
+                cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+                ok, frame = cap.read()
+                if not ok:
+                    return None
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
-        # weighted_average: linear weights (1, 2, 3, ..., n) normalized
-        n_actual = len(frames_list)
-        weights = torch.arange(1, n_actual + 1, dtype=torch.float32)
-        weights = weights / weights.sum()
-        # frames_list items are (H, W, 3); stack to (N, H, W, 3)
-        stacked = torch.stack(frames_list, dim=0)
-        # Apply weights along dim 0
-        weighted = (stacked * weights.view(-1, 1, 1, 1)).sum(dim=0)
-        return weighted.unsqueeze(0)  # (1, H, W, 3)
+            # Extract last n frames
+            start_idx = total - n
+            frames_list = []
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+            for _ in range(n):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames_list.append(torch.from_numpy(frame).float() / 255.0)
+
+            if not frames_list:
+                return None
+
+            # weighted_average: linear weights (1, 2, 3, ..., n) normalized
+            n_actual = len(frames_list)
+            weights = torch.arange(1, n_actual + 1, dtype=torch.float32)
+            weights = weights / weights.sum()
+            # frames_list items are (H, W, 3); stack to (N, H, W, 3)
+            stacked = torch.stack(frames_list, dim=0)
+            # Apply weights along dim 0
+            weighted = (stacked * weights.view(-1, 1, 1, 1)).sum(dim=0)
+            return weighted.unsqueeze(0)  # (1, H, W, 3)
+        finally:
+            cap.release()
     except Exception:
         return None
 
@@ -2397,8 +2397,13 @@ LATENT_OVERLAP_STRENGTH = 0.3  # @param {type:"number"}
 # Only active when character_mode="both" and both images are available.
 # Recommended: 0.2-0.4 for natural results with strong identity.
 
+ANCHOR_BLEND_FRAMES = 5  # @param {type:"integer"}
+# Number of leading frames in the video latent to receive anchor identity injection.
+# Independent of OVERLAP_FRAMES (which controls segment stitching overlap).
+# Higher values spread identity influence over more frames but may reduce motion freedom.
+
 print(f"   Dual-anchor  : {USE_DUAL_ANCHOR_STORYBOARD}  |  Continuity: {CONTINUITY_FRAME_FORMAT}")
-print(f"   Composite    : {CONTINUITY_COMPOSITE_MODE}  ({CONTINUITY_MULTI_FRAME_COUNT} frames)  |  Latent blend: {LATENT_OVERLAP_STRENGTH}")
+print(f"   Composite    : {CONTINUITY_COMPOSITE_MODE}  ({CONTINUITY_MULTI_FRAME_COUNT} frames)  |  Latent blend: {LATENT_OVERLAP_STRENGTH} x {ANCHOR_BLEND_FRAMES}f")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3146,7 +3151,7 @@ def generate_pro(
 
                     # Determine K = number of frames to blend into
                     _total_t = _vid_samples.shape[2] if _vid_samples.ndim == 5 else 1
-                    _K = min(OVERLAP_FRAMES, _total_t)
+                    _K = min(ANCHOR_BLEND_FRAMES, _total_t)
 
                     # Repeat anchor across K frames
                     _anchor_repeated = _anch_samples.repeat(1, 1, _K, 1, 1)
@@ -3162,9 +3167,10 @@ def generate_pro(
                         _vid_lat_input = {**_vid_lat_input, "samples": _vid_samples}
                         print(f"   \u2713 Dual-anchor blend: {_strength:.0%} anchor into first {_K} frames  (mode={_char_mode})")
                     else:
-                        # Shape mismatch - fall back to full replacement
-                        _vid_lat_input = anchor_latent
-                        print(f"   \u2713 Character anchor injected (full replace, shape mismatch)")
+                        # Shape mismatch - skip injection entirely rather than
+                        # reverting to full latent replacement (the broken behavior)
+                        print(f"   \u26a0\ufe0f  Anchor spatial dims don't match video latent - SKIPPING anchor injection.")
+                        print(f"     Anchor: {list(_anchor_repeated.shape[3:])}, Video: {list(_vid_samples[:, :, :_K, :, :].shape[3:])}")
                 else:
                     # Non-dual-anchor path: use anchor latent as the starting video latent
                     # (original behavior for anchor-only mode or when flag is disabled)
