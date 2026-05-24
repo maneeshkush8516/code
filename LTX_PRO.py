@@ -552,8 +552,9 @@ def apply_sage_attention(unet):
     try:
         node  = NODE_CLASS_MAPPINGS["PathchSageAttentionKJ"]()
         fn    = getattr(node, node.FUNCTION)
-        unet  = get_value_at_index(fn(model=unet), 0)
-        print("   ✓ SageAttention patch applied (PathchSageAttentionKJ)")
+        # sage_attention arg required by KJNodes (SVI-Pro uses "auto")
+        unet  = get_value_at_index(fn(model=unet, sage_attention="auto"), 0)
+        print("   ✓ SageAttention patch applied (PathchSageAttentionKJ, mode=auto)")
     except Exception as e:
         print(f"   ⚠️  SageAttention failed ({e}) — continuing without it.")
     return unet
@@ -2479,7 +2480,7 @@ PASS2_SEED    = 0                      # @param {type:"integer"}
 
 # ── Tiled VAE decode ──────────────────────────────────────────────────────────
 # Node [265] LTXVSpatioTemporalTiledVAEDecode from ComfyUI-LTXVideo
-USE_TILED_VAE          = True   # @param {type:"boolean"}
+USE_TILED_VAE          = False  # @param {type:"boolean"}
 TILED_SPATIAL_TILES    = 2      # @param {type:"integer"}
 TILED_SPATIAL_OVERLAP  = 8      # @param {type:"integer"}
 TILED_TEMPORAL_LEN     = 48     # @param {type:"integer"}
@@ -4654,6 +4655,224 @@ except Exception as e:
     print("   Persistent deformation (3× same) → change USER_INPUT / POSITIVE_PROMPT")
     print("   Character drift                  → try CHARACTER_CONSISTENCY_MODE='both'")
     print("                                      or increase CHARACTER_STRENGTH")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELL 9.5  ─  MERGE CLIPS INTO ONE VIDEO
+# ══════════════════════════════════════════════════════════════════════════════
+
+# @title  { "single-column": true }
+# @markdown ## 💥 9.5. Merge Multiple Clips Into One Video
+# @markdown Combine generated scene clips into a single continuous video.
+# @markdown Supports both simple concatenation (ffmpeg) and overlap blending.
+# @markdown
+# @markdown **Usage:** Set `CLIPS_TO_MERGE` to a list of video paths, then run this cell.
+
+# ── Clips to merge ───────────────────────────────────────────────────────────
+CLIPS_TO_MERGE = []  # @param
+# Add paths to clips to merge, e.g.:
+# CLIPS_TO_MERGE = [
+#     "/content/ComfyUI/output/Story01-Character_00001_.mp4",
+#     "/content/ComfyUI/output/Story02-Character_00001_.mp4",
+#     "/content/ComfyUI/output/Story03-Character_00001_.mp4",
+# ]
+
+AUTO_FIND_CLIPS = True  # @param {type:"boolean"}
+# When True AND CLIPS_TO_MERGE is empty, automatically find all clips
+# matching the OUTPUT_PREFIX pattern in the output directory.
+
+MERGE_OUTPUT_NAME = "Final_Merged"  # @param {type:"string"}
+# Output filename prefix for the merged video.
+
+MERGE_MODE = "overlap_blend"  # @param ["overlap_blend", "hard_concat", "crossfade"]
+# "overlap_blend"  — SVI-Pro style linear blend (uses OVERLAP_FRAMES setting)
+# "hard_concat"    — Simple ffmpeg concatenation (fastest, no blending)
+# "crossfade"      — Cosine-weighted crossfade at scene boundaries
+
+MERGE_FPS = 25  # @param {type:"integer"}
+# Frame rate for the merged output video.
+
+
+def merge_clips_to_video(
+    clip_paths: List[str],
+    output_name: str = "Final_Merged",
+    mode: str = "overlap_blend",
+    overlap: int = 5,
+    fps: int = 25,
+) -> Optional[str]:
+    """
+    Merge multiple video clips into a single continuous video.
+
+    Supports three modes:
+    - "overlap_blend": SVI-Pro style linear blend at boundaries (ImageBatchExtendWithOverlap)
+    - "hard_concat": Simple ffmpeg concat (no blending, preserves exact frames)
+    - "crossfade": Cosine-weighted crossfade for smooth transitions
+
+    Args:
+        clip_paths: List of video file paths to merge (in order)
+        output_name: Output filename prefix
+        mode: Merge strategy
+        overlap: Number of overlap frames for blending modes
+        fps: Output frame rate
+
+    Returns:
+        Path to the merged video file, or None on failure
+    """
+    import imageio
+
+    # Validate inputs
+    valid_paths = [p for p in clip_paths if p and os.path.exists(p)]
+    if not valid_paths:
+        print("❌ No valid clip paths provided.")
+        print("   Set CLIPS_TO_MERGE or enable AUTO_FIND_CLIPS.")
+        return None
+
+    if len(valid_paths) == 1:
+        print(f"ℹ️  Only one clip found — nothing to merge: {valid_paths[0]}")
+        return valid_paths[0]
+
+    print(f"🎬 Merging {len(valid_paths)} clips ({mode})...")
+    for i, p in enumerate(valid_paths):
+        print(f"   [{i+1}] {os.path.basename(p)}")
+
+    output_dir = "/content/ComfyUI/output"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = f"{output_dir}/{output_name}_{int(time.time())}.mp4"
+
+    # ── Mode: hard_concat (ffmpeg, fast) ──────────────────────────────────
+    if mode == "hard_concat":
+        return concatenate_clips(valid_paths, output_path)
+
+    # ── Mode: overlap_blend or crossfade (frame-level processing) ─────────
+    blend_mode = "linear_blend" if mode == "overlap_blend" else "crossfade"
+
+    try:
+        combined_frames = None
+        total_input_frames = 0
+
+        for idx, clip_path in enumerate(valid_paths):
+            print(f"   Loading clip {idx+1}/{len(valid_paths)}: {os.path.basename(clip_path)}...")
+            reader = imageio.get_reader(clip_path)
+            frames_list = [frame for frame in reader]
+            reader.close()
+            total_input_frames += len(frames_list)
+
+            seg_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0
+
+            if combined_frames is None:
+                combined_frames = seg_tensor
+            else:
+                combined_frames = blend_overlap_frames(
+                    combined_frames, seg_tensor,
+                    overlap=overlap,
+                    mode=blend_mode,
+                    side=OVERLAP_SIDE
+                )
+
+            print(f"      {len(frames_list)} frames loaded, running total: {len(combined_frames)}")
+
+        if combined_frames is None:
+            print("❌ No frames loaded — merge failed.")
+            return None
+
+        # Save merged video
+        print(f"   💾 Encoding {len(combined_frames)} frames @ {fps}fps...")
+        final_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        imageio.mimsave(output_path, [f for f in final_np], fps=fps, codec='libx264')
+
+        duration = len(combined_frames) / fps
+        saved_frames = total_input_frames - len(combined_frames)
+
+        print(f"\n{'═' * 60}")
+        print(f"✅ MERGE COMPLETE!")
+        print(f"   Output     : {output_path}")
+        print(f"   Duration   : {duration:.1f}s ({len(combined_frames)} frames @ {fps}fps)")
+        print(f"   Input clips: {len(valid_paths)}")
+        print(f"   Overlap    : {overlap} frames × {len(valid_paths)-1} boundaries = {saved_frames} frames blended")
+        print(f"   Mode       : {mode}")
+        print(f"{'═' * 60}")
+
+        # Display preview
+        if SHOW_PREVIEWS:
+            display_video(output_path)
+
+        return output_path
+
+    except Exception as e:
+        print(f"❌ Merge failed: {type(e).__name__}: {e}")
+        print("   Falling back to hard concatenation...")
+        return concatenate_clips(valid_paths, output_path)
+
+
+def auto_find_output_clips(
+    prefix: str = None,
+    output_dir: str = "/content/ComfyUI/output",
+    pattern: str = None,
+) -> List[str]:
+    """
+    Automatically find generated clips in the output directory.
+
+    Args:
+        prefix: Match clips starting with this prefix (e.g., "Story01")
+        output_dir: Directory to search
+        pattern: Glob pattern override (e.g., "Story*Character*.mp4")
+
+    Returns:
+        Sorted list of matching video paths
+    """
+    if not os.path.exists(output_dir):
+        return []
+
+    if pattern:
+        import fnmatch
+        clips = [os.path.join(output_dir, f) for f in os.listdir(output_dir)
+                 if fnmatch.fnmatch(f, pattern) and f.endswith('.mp4')]
+    elif prefix:
+        clips = [os.path.join(output_dir, f) for f in os.listdir(output_dir)
+                 if f.startswith(prefix) and f.endswith('.mp4')
+                 and '_full' not in f and '_extended' not in f]
+    else:
+        # Find all Story/Scene clips based on OUTPUT_PREFIX
+        _prefix = OUTPUT_PREFIX
+        clips = [os.path.join(output_dir, f) for f in os.listdir(output_dir)
+                 if f.endswith('.mp4') and not f.startswith('.')
+                 and '_full' not in f and '_extended' not in f
+                 and '_segments' not in f and 'Final_Merged' not in f]
+
+    clips.sort()
+    return clips
+
+
+# ── Execute merge ─────────────────────────────────────────────────────────────
+_clips_to_merge = CLIPS_TO_MERGE
+
+if not _clips_to_merge and AUTO_FIND_CLIPS:
+    print("🔍 Auto-finding clips in output directory...")
+    _clips_to_merge = auto_find_output_clips()
+    if _clips_to_merge:
+        print(f"   Found {len(_clips_to_merge)} clips:")
+        for c in _clips_to_merge:
+            print(f"      • {os.path.basename(c)}")
+    else:
+        print("   ℹ️  No clips found. Generate some clips first (Cell 9), then re-run this cell.")
+
+if _clips_to_merge:
+    merged_output = merge_clips_to_video(
+        clip_paths=_clips_to_merge,
+        output_name=MERGE_OUTPUT_NAME,
+        mode=MERGE_MODE,
+        overlap=OVERLAP_FRAMES,
+        fps=MERGE_FPS,
+    )
+    if merged_output and DOWNLOAD_AFTER_GENERATE:
+        try:
+            files.download(merged_output)
+        except Exception as e:
+            print(f"   ⚠️  Download failed ({e}) — file is at {merged_output}")
+else:
+    print("ℹ️  No clips to merge. Either:")
+    print("   1. Set CLIPS_TO_MERGE = ['/path/to/clip1.mp4', '/path/to/clip2.mp4', ...]")
+    print("   2. Or generate clips first (Cell 9 with USE_STORYBOARD=True), then re-run this cell")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
