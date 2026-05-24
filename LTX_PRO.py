@@ -766,6 +766,12 @@ def run_easy_prompt(user_input: str, frame_count: int, seed: int,
     _model = llm_model_override if llm_model_override is not None else LLM_MODEL
     print(f"   [EasyPrompt] LLM={_model} | creativity={CREATIVITY} | frames={frame_count}")
     node = NODE_CLASS_MAPPINGS["LTX2PromptArchitect"]()
+    _offline = LLM_OFFLINE_MODE
+    _lp_3b  = LOCAL_PATH_3B  if _offline else ""
+    _lp_8b  = LOCAL_PATH_8B  if _offline else ""
+    _lp_14b = LOCAL_PATH_14B if _offline else ""
+    if _offline:
+        print(f"   [EasyPrompt] Offline mode: loading from local path...")
     result = node.generate(
         bypass=False,
         user_input=user_input,
@@ -773,12 +779,12 @@ def run_easy_prompt(user_input: str, frame_count: int, seed: int,
         seed=seed,
         invent_dialogue=INVENT_DIALOGUE,
         keep_model_loaded=False,
-        offline_mode=False,
+        offline_mode=_offline,
         frame_count=frame_count,
         model=_LLM_LABEL_MAP.get(_model, "8B - NeuralDaredevil (High Quality)"),
-        local_path_8b="",
-        local_path_3b="",
-        local_path_14b="",
+        local_path_8b=_lp_8b,
+        local_path_3b=_lp_3b,
+        local_path_14b=_lp_14b,
         scene_context=scene_context,
         lora_triggers=LORA_TRIGGERS,
     )
@@ -813,11 +819,15 @@ def run_vision_describe(image_tensor: torch.Tensor,
 
     print(f"   [VisionDescribe] model={_vis_mod} | image shape={image_tensor.shape}")
     node = NODE_CLASS_MAPPINGS["LTX2VisionDescribe"]()
+    _vis_offline = VISION_OFFLINE_MODE
+    _vis_local   = VISION_LOCAL_PATH if _vis_offline else ""
+    if _vis_offline:
+        print(f"   [VisionDescribe] Offline mode: loading from {_vis_local}")
     result = node.describe(
         image=image_tensor,
         model_name=_VISION_LABEL_MAP.get(_vis_mod, "Qwen2.5-VL-3B — Fast (huihui abliterated)"),
-        offline_mode=False,
-        local_path="",
+        offline_mode=_vis_offline,
+        local_path=_vis_local,
     )
     ctx = result[0]
     if character_desc:
@@ -2129,6 +2139,24 @@ LORA_TRIGGERS = ""          # @param {type:"string"}
 # LoRA trigger words injected at the start of every expanded prompt.
 # e.g. "ohwx woman" or "film grain, 35mm"
 
+# ── LLM Offline Mode & Local Paths ───────────────────────────────────────────
+LLM_OFFLINE_MODE = False    # @param {type:"boolean"}
+# When True, loads LLM from local disk (LOCAL_PATH_*) instead of downloading.
+# Requires models to be pre-cached at the specified paths.
+
+LOCAL_PATH_3B = "/content/ComfyUI/huggingface/hub/models--huihui-ai--Llama-3.2-3B-Instruct-abliterated/snapshots/ba0be3c4683117ffe70be5cc767723e0210e437e"  # @param {type:"string"}
+# Local path for 3B model (Llama-3.2-3B-Instruct-abliterated).
+# Default matches HuggingFace cache structure.
+# Original cache: /root/.cache/huggingface/hub/models--huihui-ai--Llama-3.2-3B-Instruct-abliterated/snapshots/...
+
+LOCAL_PATH_8B = "/content/ComfyUI/huggingface/hub/models--NeuralDaredevil--Llama-3.1-8B-abliterated/snapshots/latest"  # @param {type:"string"}
+# Local path for 8B model (NeuralDaredevil-8B-abliterated).
+# Set to your local snapshot directory.
+
+LOCAL_PATH_14B = "/content/ComfyUI/huggingface/hub/models--Qwen--Qwen3-14B-abliterated/snapshots/latest"  # @param {type:"string"}
+# Local path for 14B model (Qwen3-14B-abliterated).
+# Set to your local snapshot directory.
+
 # ── Vision image describer (LTX2VisionDescribe node) ─────────────────────────
 USE_VISION   = True          # @param {type:"boolean"}
 # When True AND an image is provided, Vision Describe analyses it and passes
@@ -2137,6 +2165,13 @@ USE_VISION   = True          # @param {type:"boolean"}
 VISION_MODEL = "3B-fast"     # @param ["3B-fast", "7B-nsfw"]
 # "3B-fast" → Qwen2.5-VL-3B — faster, ~5 GB VRAM
 # "7B-nsfw" → Qwen2.5-VL-7B — more accurate, ~10 GB VRAM
+
+VISION_OFFLINE_MODE = False  # @param {type:"boolean"}
+# When True, loads Vision model from VISION_LOCAL_PATH instead of downloading.
+
+VISION_LOCAL_PATH = "/content/ComfyUI/huggingface/hub/models--huihui-ai--Qwen2.5-VL-3B-Instruct-abliterated/snapshots/latest"  # @param {type:"string"}
+# Local path for Vision model (Qwen2.5-VL-3B or 7B).
+# Set to your local snapshot directory.
 
 # ── Display & output ──────────────────────────────────────────────────────────
 SHOW_PREVIEWS           = True   # @param {type:"boolean"}
@@ -2149,6 +2184,11 @@ DOWNLOAD_AFTER_GENERATE = False  # @param {type:"boolean"}
 print("✅ Easy Prompt + Vision settings ready.")
 print(f"   LLM: {LLM_MODEL}  |  Vision: {VISION_MODEL}  |  "
       f"Creativity: {CREATIVITY}  |  Bypass: {BYPASS_EASY_PROMPT}")
+print(f"   LLM offline : {LLM_OFFLINE_MODE}  |  Vision offline: {VISION_OFFLINE_MODE}")
+if LLM_OFFLINE_MODE:
+    print(f"   LLM path    : {LOCAL_PATH_3B if LLM_MODEL == '3B' else LOCAL_PATH_8B if LLM_MODEL == '8B' else LOCAL_PATH_14B}")
+if VISION_OFFLINE_MODE:
+    print(f"   Vision path : {VISION_LOCAL_PATH}")
 print(f"   Show previews: {SHOW_PREVIEWS}  |  Auto-download: {DOWNLOAD_AFTER_GENERATE}")
 
 
