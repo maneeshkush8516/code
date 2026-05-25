@@ -4981,32 +4981,42 @@ print("   Edit SCENES list above, then set USE_STORYBOARD=True in Cell 9.")
 _current_seed = SEED
 
 try:
-    # ── Script Intelligence: decompose script into SCENES (FEAT-003) ──────
+    # ── Script Intelligence: use Cell 4.5 decomposed scenes if available ──
     if USE_SCRIPT_DECOMPOSER and SCRIPT_INPUT and SCRIPT_INPUT.strip():
-        print("📜 Script Decomposer active - breaking script into shots...")
-        try:
-            _script_scenes = []
-            _sentences = [s.strip() for s in SCRIPT_INPUT.replace(".", ".\n").split("\n") if s.strip()]
-            for idx, sentence in enumerate(_sentences):
-                _scene_dict = {
-                    "user_input": sentence,
-                    "image_path": CHARACTER_IMAGE_PATH if idx == 0 else None,
-                    "frames": FRAMES,
-                    "seed": SEED + idx,
-                    "output_prefix": f"Script{idx+1:02d}-{CHARACTER_NAME}",
-                    "character_image_path": CHARACTER_IMAGE_PATH,
-                    "character_mode": CHARACTER_CONSISTENCY_MODE,
-                }
-                if AUTO_CAMERA_SELECT:
-                    _cam = auto_select_camera_lora(sentence)
-                    if _cam != "none":
-                        _scene_dict["camera_lora"] = _cam
-                _script_scenes.append(_scene_dict)
-            SCENES = _script_scenes
+        # Check if Cell 4.5 already decomposed the script (preferred path)
+        if '_decomposed_scenes' in dir() and _decomposed_scenes and len(_decomposed_scenes) > 0:
+            # Cell 4.5 already generated proper multi-segment SCENES
+            SCENES = _decomposed_scenes
             USE_STORYBOARD = True
-            print(f"   ✓ Decomposed into {len(SCENES)} shots")
-        except Exception as e:
-            print(f"   ⚠️  Script decomposition failed ({e}) - using manual SCENES")
+            print(f"📜 Using Cell 4.5 Script Intelligence: {len(SCENES)} shots "
+                  f"({TARGET_VIDEO_DURATION}s target, {SEGMENT_DURATION}s/segment)")
+        else:
+            # Fallback: Cell 4.5 didn't run or failed - do basic decomposition
+            print("📜 Script Decomposer (fallback) - breaking script into shots...")
+            try:
+                _decomposed_scenes = decompose_script_to_scenes(
+                    script=SCRIPT_INPUT,
+                    target_duration=TARGET_VIDEO_DURATION,
+                    segment_duration=SEGMENT_DURATION,
+                    dialogue_interval=DIALOGUE_INTERVAL,
+                    quality=VIDEO_QUALITY,
+                    style=VIDEO_STYLE,
+                    language=CUSTOM_LANGUAGE if VIDEO_LANGUAGE == "Custom" else VIDEO_LANGUAGE,
+                    character_def=CHARACTER_DEFINITION,
+                    secondary_char=SECONDARY_CHARACTER,
+                    output_format=SCENE_OUTPUT_FORMAT,
+                    fps=FPS,
+                )
+                if _decomposed_scenes:
+                    SCENES = _decomposed_scenes
+                    USE_STORYBOARD = True
+                    print(f"   ✓ Decomposed into {len(SCENES)} shots "
+                          f"({TARGET_VIDEO_DURATION}s, {SEGMENT_DURATION}s/segment)")
+                    print_scene_breakdown(SCENES)
+                else:
+                    print("   ⚠️  Decomposition returned empty - using manual SCENES")
+            except Exception as e:
+                print(f"   ⚠️  Script decomposition failed ({e}) - using manual SCENES")
 
     if USE_STORYBOARD:
         # ── Multi-scene storyboard mode ───────────────────────────────────
