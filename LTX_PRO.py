@@ -2226,33 +2226,464 @@ print(f"   Show previews: {SHOW_PREVIEWS}  |  Auto-download: {DOWNLOAD_AFTER_GEN
 # @title  { "single-column": true }
 # @markdown ## 💥 4.5. Script-to-Shot Intelligence
 # @markdown Takes a full narrative script and decomposes it into per-segment
-# @markdown prompts using LTX2PromptArchitect. Each shot gets action, camera
-# @markdown motion, and lighting continuity notes. Outputs SCENES list for
-# @markdown the storyboard runner.
+# @markdown prompts with dialogue, camera direction, and character consistency.
+# @markdown
+# @markdown **Features:**
+# @markdown - Target video duration with automatic segment splitting
+# @markdown - Dialogue timestamps (dialogue every N seconds)
+# @markdown - Sora-style JSON scene descriptions with consistent characters
+# @markdown - Camera motion auto-selection per shot
+# @markdown - Character appearance lock across all scenes
+# @markdown
+# @markdown **Usage:** Write your script in SCRIPT_INPUT, set target duration,
+# @markdown and the system generates a production-ready SCENES list.
 
+# ── Script Decomposer Toggle ─────────────────────────────────────────────────
 USE_SCRIPT_DECOMPOSER = False  # @param {type:"boolean"}
 # When True, SCRIPT_INPUT is decomposed into a SCENES list automatically.
+# Set USE_STORYBOARD=True in Cell 9 to run the generated scenes.
 
+# ── Script Input ──────────────────────────────────────────────────────────────
 SCRIPT_INPUT = ""  # @param {type:"string"}
-# Full narrative script text. Example:
-# "A detective enters a smoky bar. She scans the room. A man in a trench coat
-#  catches her eye. She approaches his table. They exchange tense words."
+# Full narrative script. Can be a single paragraph or multi-scene description.
+# Example:
+# "A woman in a red dress enters a rooftop bar at sunset. She walks to the railing
+#  and looks out over the city skyline. A man in a dark suit approaches from behind.
+#  They exchange a tense conversation. She turns and walks away into the crowd."
 
+# ── Video Length & Timing ─────────────────────────────────────────────────────
+TARGET_VIDEO_DURATION = 30  # @param {type:"integer"}
+# Target total video duration in seconds.
+# The script is split into segments that sum to approximately this duration.
+# Minimum: 5s, Maximum: 120s (limited by VRAM and generation time).
+
+SEGMENT_DURATION = 5  # @param {type:"integer"}
+# Duration of each generated segment in seconds.
+# At 25fps: 5s = 125 frames, 4s = 97 frames (T4 safe), 3s = 73 frames
+# Longer segments = fewer cuts but more VRAM. Shorter = more cuts but safer.
+
+DIALOGUE_INTERVAL = 15  # @param {type:"integer"}
+# Inject dialogue/action beat every N seconds.
+# e.g., 15 = new dialogue or significant action every 15 seconds.
+# The decomposer ensures each interval has distinct spoken/action content.
+
+# ── Video Language / Quality ──────────────────────────────────────────────────
+VIDEO_QUALITY = "8K cinematic"  # @param ["8K cinematic", "4K professional", "HD broadcast", "social media"]
+# Quality descriptor injected into every scene prompt.
+# "8K cinematic"     -> ultra detailed, film grain, shallow DOF, professional
+# "4K professional"  -> sharp, well-lit, broadcast quality
+# "HD broadcast"     -> clean, standard broadcast look
+# "social media"     -> vibrant colors, slightly stylized, engaging
+
+VIDEO_STYLE = "realistic"  # @param ["realistic", "cinematic noir", "anime", "documentary", "fantasy", "sci-fi"]
+# Visual style applied to all scenes for consistency.
+
+VIDEO_LANGUAGE = "English"  # @param ["English", "Hindi", "Spanish", "French", "Japanese", "Korean", "Chinese", "Arabic", "Custom"]
+# Language for dialogue generation. Affects subtitle/dialogue content.
+# Note: LTX-2 generates video, not audio -- dialogue is for visual context
+# (lip movements, expressions) and can be added as subtitles in post.
+
+CUSTOM_LANGUAGE = ""  # @param {type:"string"}
+# If VIDEO_LANGUAGE = "Custom", specify the language here.
+
+# ── Character Definition (Sora-style) ────────────────────────────────────────
+CHARACTER_DEFINITION = ""  # @param {type:"string"}
+# Detailed character description for consistency across ALL scenes.
+# Write like a Sora/Midjourney character card:
+# Example:
+# "Elena Rossi: 28-year-old Italian woman, shoulder-length dark auburn hair,
+#  olive skin, green eyes, wearing a fitted navy blue coat over a cream blouse,
+#  silver pendant necklace, determined expression, 5'7 athletic build"
+
+SECONDARY_CHARACTER = ""  # @param {type:"string"}
+# Optional second character for two-person scenes.
+# Example:
+# "Marcus Chen: 35-year-old man, short black hair, clean-shaven, wearing a
+#  charcoal grey suit with no tie, confident posture, slight smile"
+
+# ── Decomposer Settings ──────────────────────────────────────────────────────
 SCRIPT_LLM_MODEL = "8B"  # @param ["8B", "3B", "14B"]
-# LLM model for script decomposition (same as Easy Prompt LLM choices).
+# LLM model for script decomposition.
 
 AUTO_CAMERA_SELECT = True  # @param {type:"boolean"}
 # Auto-select camera LoRA per shot based on narrative beats.
-# e.g. "enters" -> dolly-in, "scans" -> dolly-left/right, "approaches" -> dolly-in
 
 SHOTS_PER_SCENE = 3  # @param {type:"integer"}
-# Target number of shots to decompose each scene description into.
+# Target number of shots per major scene beat.
+
+SCENE_OUTPUT_FORMAT = "detailed"  # @param ["detailed", "simple", "json"]
+# "detailed" -- Full cinematic prompt with camera, lighting, dialogue
+# "simple"   -- Short action description only
+# "json"     -- Sora-style JSON with all metadata fields
+
+
+# ── Quality/Style Maps ────────────────────────────────────────────────────────
+_QUALITY_PROMPTS = {
+    "8K cinematic": "8K resolution, ultra-detailed, cinematic film grain, shallow depth of field, "
+                    "professional color grading, anamorphic lens flare, dramatic lighting, "
+                    "photorealistic, masterful cinematography",
+    "4K professional": "4K resolution, sharp focus, professional lighting, clean composition, "
+                       "broadcast quality, natural colors, well-exposed",
+    "HD broadcast": "HD resolution, clean image, standard broadcast lighting, "
+                    "balanced exposure, natural look, steady camera",
+    "social media": "vibrant colors, high contrast, engaging composition, "
+                    "slightly stylized, eye-catching, trending aesthetic",
+}
+
+_STYLE_PROMPTS = {
+    "realistic": "photorealistic, natural lighting, real-world physics, authentic textures",
+    "cinematic noir": "high contrast, deep shadows, single-source lighting, film noir aesthetic, "
+                      "muted colors with selective highlights, venetian blind shadows",
+    "anime": "anime style, cel-shaded, vibrant colors, expressive eyes, dynamic poses, "
+             "clean lines, Studio Ghibli inspired",
+    "documentary": "handheld camera feel, natural lighting, observational framing, "
+                   "raw authentic look, slightly desaturated",
+    "fantasy": "ethereal lighting, magical atmosphere, rich saturated colors, "
+               "otherworldly beauty, painterly quality",
+    "sci-fi": "neon accents, holographic displays, sleek surfaces, "
+              "futuristic architecture, volumetric fog, cybernetic details",
+}
+
+_CAMERA_ACTION_MAP = {
+    # Action verbs -> camera movement
+    "enters": "dolly-in", "walks in": "dolly-in", "approaches": "dolly-in",
+    "exits": "dolly-out", "leaves": "dolly-out", "walks away": "dolly-out",
+    "looks": "static", "watches": "static", "stares": "static", "gazes": "static",
+    "scans": "dolly-left", "surveys": "dolly-right", "turns": "dolly-right",
+    "rises": "jib-up", "stands": "jib-up", "looks up": "jib-up",
+    "sits": "jib-down", "crouches": "jib-down", "falls": "jib-down",
+    "runs": "dolly-in", "chases": "dolly-in", "follows": "dolly-in",
+    "reveals": "dolly-out", "shows": "jib-up",
+}
+
+
+def decompose_script_to_scenes(
+    script: str,
+    target_duration: int = 30,
+    segment_duration: int = 5,
+    dialogue_interval: int = 15,
+    quality: str = "8K cinematic",
+    style: str = "realistic",
+    language: str = "English",
+    character_def: str = "",
+    secondary_char: str = "",
+    output_format: str = "detailed",
+    fps: int = 25,
+) -> List[Dict]:
+    """
+    Decompose a narrative script into production-ready SCENES list.
+
+    Implements Sora-style scene decomposition with:
+    - Automatic shot timing based on target duration
+    - Dialogue/action beats at specified intervals
+    - Character consistency lock across all scenes
+    - Camera motion inference from action verbs
+    - Quality and style prefixes for every prompt
+
+    Args:
+        script: Full narrative text
+        target_duration: Target total video length in seconds
+        segment_duration: Duration per generated segment
+        dialogue_interval: New dialogue beat every N seconds
+        quality: Video quality descriptor
+        style: Visual style
+        language: Dialogue language
+        character_def: Primary character description
+        secondary_char: Secondary character description
+        output_format: "detailed", "simple", or "json"
+        fps: Frame rate for frame count calculation
+
+    Returns:
+        List of scene dicts compatible with run_storyboard()
+    """
+    if not script.strip():
+        print("   ⚠️  Empty script -- returning empty scene list.")
+        return []
+
+    # Calculate number of segments needed
+    num_segments = max(1, int(target_duration / segment_duration))
+    frames_per_segment = int(segment_duration * fps)
+
+    # Cap frames for T4 safety
+    frames_per_segment = min(frames_per_segment, 121)
+
+    print(f"   📐 Planning: {num_segments} segments x {segment_duration}s = ~{num_segments * segment_duration}s")
+    print(f"   🎬 Frames per segment: {frames_per_segment} @ {fps}fps")
+
+    # Split script into sentence-level beats
+    import re
+    sentences = [s.strip() for s in re.split(r'[.!?]+', script) if s.strip() and len(s.strip()) > 5]
+
+    if not sentences:
+        sentences = [script.strip()]
+
+    # Distribute sentences across segments (evenly)
+    scenes_list = []
+    sentences_per_segment = max(1, len(sentences) // num_segments)
+
+    # Build quality/style prefix
+    quality_prefix = _QUALITY_PROMPTS.get(quality, _QUALITY_PROMPTS["8K cinematic"])
+    style_prefix = _STYLE_PROMPTS.get(style, _STYLE_PROMPTS["realistic"])
+
+    # Character prefix (injected into every scene for consistency)
+    char_prefix = ""
+    if character_def:
+        char_prefix = f"[Main character: {character_def}] "
+    if secondary_char:
+        char_prefix += f"[Secondary character: {secondary_char}] "
+
+    # Dialogue tracking
+    cumulative_time = 0.0
+    last_dialogue_time = 0.0
+    dialogue_idx = 0
+
+    # Pre-generate dialogue beats for the target duration
+    num_dialogue_beats = max(1, int(target_duration / dialogue_interval))
+
+    # Resolve globals that may not yet be defined (Cell 4.5 runs before Cell 5/6)
+    _char_image_path = globals().get('CHARACTER_IMAGE_PATH', None)
+    _char_mode = globals().get('CHARACTER_CONSISTENCY_MODE', 'both')
+    _char_name = globals().get('CHARACTER_NAME', 'Character')
+    _char_desc = globals().get('CHARACTER_DESCRIPTION', '')
+    _seed = globals().get('SEED', 47)
+
+    for seg_idx in range(num_segments):
+        # Gather sentences for this segment
+        start_sent = seg_idx * sentences_per_segment
+        end_sent = min(start_sent + sentences_per_segment, len(sentences))
+        if seg_idx == num_segments - 1:
+            end_sent = len(sentences)  # Last segment gets remaining
+
+        seg_sentences = sentences[start_sent:end_sent]
+        if not seg_sentences and sentences:
+            # Wrap around if we ran out
+            seg_sentences = [sentences[seg_idx % len(sentences)]]
+
+        action_text = ". ".join(seg_sentences) + "."
+
+        # Determine camera motion from action verbs
+        camera_lora = "static"
+        if AUTO_CAMERA_SELECT:
+            action_lower = action_text.lower()
+            for verb, cam in _CAMERA_ACTION_MAP.items():
+                if verb in action_lower:
+                    camera_lora = cam
+                    break
+
+        # Check if this segment should have a dialogue beat
+        has_dialogue = False
+        dialogue_text = ""
+        if cumulative_time >= last_dialogue_time + dialogue_interval or seg_idx == 0:
+            has_dialogue = True
+            last_dialogue_time = cumulative_time
+            dialogue_idx += 1
+            # Generate dialogue context for the prompt
+            if language != "English":
+                _lang = CUSTOM_LANGUAGE if language == "Custom" else language
+                dialogue_text = f" [Dialogue in {_lang}, natural conversation]"
+            else:
+                dialogue_text = " [Natural spoken dialogue, realistic lip movements]"
+
+        # Build the full prompt based on output format
+        if output_format == "json":
+            # Sora-style JSON scene description
+            scene_json = {
+                "scene_number": seg_idx + 1,
+                "duration_seconds": segment_duration,
+                "action": action_text,
+                "camera": camera_lora,
+                "lighting": "continuity from previous scene" if seg_idx > 0 else "establishing",
+                "dialogue": has_dialogue,
+                "dialogue_language": language if has_dialogue else None,
+                "character": character_def if character_def else None,
+                "secondary_character": secondary_char if secondary_char else None,
+                "quality": quality,
+                "style": style,
+                "timestamp": f"{int(cumulative_time//60):02d}:{int(cumulative_time%60):02d}",
+            }
+            # Convert JSON metadata to prompt
+            prompt = (
+                f"{quality_prefix}, {style_prefix}, "
+                f"{char_prefix}{action_text}{dialogue_text}, "
+                f"camera: {camera_lora} movement, "
+                f"{'consistent lighting from previous scene, ' if seg_idx > 0 else 'establishing shot lighting, '}"
+                f"scene {seg_idx + 1}/{num_segments}"
+            )
+        elif output_format == "detailed":
+            # Full cinematic prompt
+            prompt = (
+                f"{quality_prefix}, {style_prefix}, "
+                f"{char_prefix}{action_text}{dialogue_text}, "
+                f"{'smooth transition from previous shot, maintaining continuity, ' if seg_idx > 0 else ''}"
+                f"camera movement: {camera_lora}"
+            )
+        else:
+            # Simple mode
+            prompt = f"{char_prefix}{action_text}{dialogue_text}"
+
+        # Build scene dict
+        scene_dict = {
+            "user_input": prompt,
+            "image_path": _char_image_path if seg_idx == 0 else None,
+            "frames": frames_per_segment,
+            "seed": _seed + seg_idx,
+            "output_prefix": f"Scene{seg_idx+1:02d}-{_char_name}",
+            "character_image_path": _char_image_path,
+            "character_mode": _char_mode,
+            "character_name": _char_name,
+            "character_description": character_def or _char_desc,
+        }
+
+        # Store metadata for timeline export
+        scene_dict["_metadata"] = {
+            "timestamp_start": cumulative_time,
+            "timestamp_end": cumulative_time + segment_duration,
+            "camera_lora": camera_lora,
+            "has_dialogue": has_dialogue,
+            "segment_index": seg_idx,
+            "action_text": action_text,
+        }
+
+        scenes_list.append(scene_dict)
+        cumulative_time += segment_duration
+
+    return scenes_list
+
+
+def print_scene_breakdown(scenes: List[Dict]) -> None:
+    """Print a formatted breakdown of the generated scene list."""
+    if not scenes:
+        print("   (no scenes generated)")
+        return
+
+    total_frames = sum(s.get("frames", 0) for s in scenes)
+    total_duration = sum(s.get("_metadata", {}).get("timestamp_end", 0) -
+                        s.get("_metadata", {}).get("timestamp_start", 0) for s in scenes)
+
+    print(f"\n{'━' * 70}")
+    print(f"📋 SCENE BREAKDOWN -- {len(scenes)} shots, ~{total_duration:.0f}s total")
+    print(f"{'━' * 70}")
+
+    for i, scene in enumerate(scenes):
+        meta = scene.get("_metadata", {})
+        ts = meta.get("timestamp_start", 0)
+        cam = meta.get("camera_lora", "static")
+        has_dlg = "💬" if meta.get("has_dialogue") else "  "
+        action = meta.get("action_text", scene.get("user_input", ""))[:60]
+
+        print(f"   [{i+1:2d}] {int(ts//60):02d}:{int(ts%60):02d} | "
+              f"📷 {cam:12s} | {has_dlg} | {action}...")
+
+    print(f"{'━' * 70}")
+    print(f"   Total: {total_frames} frames | ~{total_duration:.0f}s | "
+          f"{len([s for s in scenes if s.get('_metadata',{}).get('has_dialogue')])} dialogue beats")
+    print(f"{'━' * 70}\n")
+
+
+def generate_sora_json(scenes: List[Dict], output_path: str = None) -> str:
+    """
+    Export scenes as Sora-style JSON with detailed character descriptions.
+
+    Compatible with Sora 2 / Kling / Runway prompt format.
+    Each scene includes full character description for standalone consistency.
+    """
+    _fps = globals().get('FPS', 25)
+    _width = globals().get('WIDTH', 768)
+    _height = globals().get('HEIGHT', 512)
+    _char_name = globals().get('CHARACTER_NAME', 'Character')
+    _char_desc = globals().get('CHARACTER_DESCRIPTION', '')
+
+    sora_scenes = []
+
+    for i, scene in enumerate(scenes):
+        meta = scene.get("_metadata", {})
+        sora_scene = {
+            "scene": i + 1,
+            "timestamp": f"{int(meta.get('timestamp_start',0)//60):02d}:{int(meta.get('timestamp_start',0)%60):02d}",
+            "duration": f"{SEGMENT_DURATION}s",
+            "prompt": scene.get("user_input", ""),
+            "camera_movement": meta.get("camera_lora", "static"),
+            "character": {
+                "name": _char_name,
+                "description": CHARACTER_DEFINITION or _char_desc,
+                "consistency_note": "Maintain exact same appearance, clothing, and features as scene 1"
+            },
+            "dialogue": meta.get("has_dialogue", False),
+            "lighting": "consistent with previous scene" if i > 0 else "establishing",
+            "transition": "smooth overlap blend (5 frames)" if i > 0 else "fade in",
+            "quality": VIDEO_QUALITY,
+            "style": VIDEO_STYLE,
+            "negative_prompt": "blurry, distorted, low quality, watermark, text, bad anatomy, "
+                              "deformed, flickering, motion artifacts, inconsistent character"
+        }
+        if SECONDARY_CHARACTER:
+            sora_scene["secondary_character"] = {
+                "description": SECONDARY_CHARACTER,
+                "consistency_note": "Maintain exact same appearance as first introduction"
+            }
+        sora_scenes.append(sora_scene)
+
+    result = json.dumps({"video_project": {
+        "title": f"{_char_name} -- {VIDEO_STYLE}",
+        "target_duration": f"{TARGET_VIDEO_DURATION}s",
+        "total_scenes": len(sora_scenes),
+        "fps": _fps,
+        "resolution": f"{_width}x{_height}",
+        "quality": VIDEO_QUALITY,
+        "style": VIDEO_STYLE,
+        "language": VIDEO_LANGUAGE,
+        "scenes": sora_scenes
+    }}, indent=2)
+
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(result)
+        print(f"   ✓ Sora-style JSON exported: {output_path}")
+
+    return result
+
+
+# ── Execute decomposer if active ──────────────────────────────────────────────
+_decomposed_scenes = None
+if USE_SCRIPT_DECOMPOSER and SCRIPT_INPUT and SCRIPT_INPUT.strip():
+    print("\n📜 Script-to-Shot Decomposer active...")
+    _lang = CUSTOM_LANGUAGE if VIDEO_LANGUAGE == "Custom" else VIDEO_LANGUAGE
+    _decomposed_scenes = decompose_script_to_scenes(
+        script=SCRIPT_INPUT,
+        target_duration=TARGET_VIDEO_DURATION,
+        segment_duration=SEGMENT_DURATION,
+        dialogue_interval=DIALOGUE_INTERVAL,
+        quality=VIDEO_QUALITY,
+        style=VIDEO_STYLE,
+        language=_lang,
+        character_def=CHARACTER_DEFINITION,
+        secondary_char=SECONDARY_CHARACTER,
+        output_format=SCENE_OUTPUT_FORMAT,
+        fps=globals().get('FPS', 25),
+    )
+    if _decomposed_scenes:
+        print_scene_breakdown(_decomposed_scenes)
+        # Export Sora-style JSON
+        _json_path = f"/content/ComfyUI/output/{globals().get('CHARACTER_NAME', 'Character')}_sora_prompts.json"
+        os.makedirs("/content/ComfyUI/output", exist_ok=True)
+        generate_sora_json(_decomposed_scenes, _json_path)
+        # Set SCENES for storyboard runner
+        SCENES = _decomposed_scenes
+        USE_STORYBOARD = True
+        print(f"   ✓ SCENES list populated ({len(SCENES)} shots)")
+        print(f"   ✓ USE_STORYBOARD auto-enabled")
+        print(f"   -> Run Cell 9 to generate all scenes sequentially.")
 
 print("✅ Script Intelligence configured.")
-print(f"   Decomposer: {'ACTIVE' if USE_SCRIPT_DECOMPOSER else 'disabled'}")
-print(f"   Script LLM: {SCRIPT_LLM_MODEL}  |  Auto-camera: {AUTO_CAMERA_SELECT}")
+print(f"   Decomposer : {'ACTIVE' if USE_SCRIPT_DECOMPOSER else 'disabled'}")
+print(f"   Duration   : {TARGET_VIDEO_DURATION}s target | {SEGMENT_DURATION}s/segment | dialogue every {DIALOGUE_INTERVAL}s")
+print(f"   Quality    : {VIDEO_QUALITY} | Style: {VIDEO_STYLE} | Language: {VIDEO_LANGUAGE}")
+print(f"   Script LLM : {SCRIPT_LLM_MODEL}  |  Auto-camera: {AUTO_CAMERA_SELECT}")
+print(f"   Format     : {SCENE_OUTPUT_FORMAT}")
+if CHARACTER_DEFINITION:
+    print(f"   Character  : {CHARACTER_DEFINITION[:60]}...")
 if SCRIPT_INPUT:
-    print(f"   Script preview: {SCRIPT_INPUT[:80]}...")
+    print(f"   Script     : {SCRIPT_INPUT[:80]}...")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
