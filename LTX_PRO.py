@@ -4887,8 +4887,56 @@ def run_storyboard(
                 if combined_frames is not None:
                     final_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                     import imageio
-                    imageio.mimsave(final_path, [f for f in final_np], fps=FPS, codec='libx264')
-                    print(f"   🎬 Final video (overlap-blended): {final_path}")
+                    # Save frames first, then mux audio from source clips
+                    _temp_stitch = final_path.replace('.mp4', '_temp_noaudio.mp4')
+                    imageio.mimsave(_temp_stitch, [f for f in final_np], fps=FPS, codec='libx264')
+                    
+                    # Try to mux audio from source clips
+                    _stitch_has_audio = False
+                    try:
+                        _probe_cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a",
+                                     "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                                     successful_clips[0]]
+                        _probe_result = subprocess.run(_probe_cmd, capture_output=True, text=True)
+                        _stitch_has_audio = "audio" in _probe_result.stdout
+                    except Exception:
+                        pass
+                    
+                    if _stitch_has_audio:
+                        try:
+                            _audio_list_f = "/tmp/stitch_audio_list.txt"
+                            with open(_audio_list_f, "w") as f:
+                                for p in successful_clips:
+                                    f.write(f"file '{p}'\n")
+                            _temp_audio_f = final_path.replace('.mp4', '_temp_audio.aac')
+                            subprocess.run([
+                                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                                "-i", _audio_list_f, "-vn", "-acodec", "aac",
+                                "-b:a", "192k", _temp_audio_f
+                            ], check=True, capture_output=True)
+                            _vid_dur = len(combined_frames) / FPS
+                            subprocess.run([
+                                "ffmpeg", "-y",
+                                "-i", _temp_stitch,
+                                "-i", _temp_audio_f,
+                                "-c:v", "copy", "-c:a", "aac",
+                                "-t", str(_vid_dur),
+                                "-shortest",
+                                final_path
+                            ], check=True, capture_output=True)
+                            if os.path.exists(_temp_stitch):
+                                os.remove(_temp_stitch)
+                            if os.path.exists(_temp_audio_f):
+                                os.remove(_temp_audio_f)
+                            print(f"   🎬 Final video (overlap-blended + audio): {final_path}")
+                        except Exception as _ae:
+                            print(f"   ⚠️  Audio mux failed ({_ae}) — using video-only.")
+                            if os.path.exists(_temp_stitch):
+                                os.rename(_temp_stitch, final_path)
+                            print(f"   🎬 Final video (overlap-blended, no audio): {final_path}")
+                    else:
+                        os.rename(_temp_stitch, final_path)
+                        print(f"   🎬 Final video (overlap-blended): {final_path}")
                     concat_result = final_path
                 else:
                     concat_result = concatenate_clips(successful_clips, final_path)
@@ -5276,10 +5324,72 @@ def merge_clips_to_video(
             print("❌ No frames loaded — merge failed.")
             return None
 
-        # Save merged video
+        # Save merged video (frames only first, then mux audio)
         print(f"   💾 Encoding {len(combined_frames)} frames @ {fps}fps...")
         final_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        imageio.mimsave(output_path, [f for f in final_np], fps=fps, codec='libx264')
+        
+        # Step 1: Save video frames to a temporary file
+        _temp_video = output_path.replace('.mp4', '_temp_noaudio.mp4')
+        imageio.mimsave(_temp_video, [f for f in final_np], fps=fps, codec='libx264')
+        
+        # Step 2: Extract and concatenate audio from source clips, then mux
+        _has_audio = False
+        try:
+            # Check if first clip has an audio stream
+            _probe_cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a",
+                         "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                         valid_paths[0]]
+            _probe_result = subprocess.run(_probe_cmd, capture_output=True, text=True)
+            _has_audio = "audio" in _probe_result.stdout
+        except Exception:
+            _has_audio = False
+        
+        if _has_audio:
+            print("   🔊 Muxing audio from source clips...")
+            try:
+                # Concatenate audio from all source clips
+                _audio_list = "/tmp/audio_concat_list.txt"
+                with open(_audio_list, "w") as f:
+                    for p in valid_paths:
+                        f.write(f"file '{p}'\n")
+                
+                # Extract concatenated audio
+                _temp_audio = output_path.replace('.mp4', '_temp_audio.aac')
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", _audio_list, "-vn", "-acodec", "aac",
+                    "-b:a", "192k", _temp_audio
+                ], check=True, capture_output=True)
+                
+                # Mux video (blended frames) + audio (concatenated from sources)
+                # Trim audio to match video duration
+                _video_duration = len(combined_frames) / fps
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", _temp_video,
+                    "-i", _temp_audio,
+                    "-c:v", "copy", "-c:a", "aac",
+                    "-t", str(_video_duration),
+                    "-shortest",
+                    output_path
+                ], check=True, capture_output=True)
+                
+                # Cleanup temp files
+                if os.path.exists(_temp_video):
+                    os.remove(_temp_video)
+                if os.path.exists(_temp_audio):
+                    os.remove(_temp_audio)
+                
+                print("   ✓ Audio muxed successfully")
+            except Exception as audio_err:
+                print(f"   ⚠️  Audio mux failed ({audio_err}) — video saved without audio.")
+                # Fallback: just use the video-only file
+                if os.path.exists(_temp_video):
+                    os.rename(_temp_video, output_path)
+        else:
+            # No audio in source clips — just rename temp to final
+            os.rename(_temp_video, output_path)
+            print("   ℹ️  No audio detected in source clips — video-only output.")
 
         duration = len(combined_frames) / fps
         saved_frames = total_input_frames - len(combined_frames)
