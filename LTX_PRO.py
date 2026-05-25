@@ -2135,9 +2135,11 @@ BYPASS_EASY_PROMPT = False  # @param {type:"boolean"}
 # True  → skip LLM, use POSITIVE_PROMPT directly (fast/manual control)
 # False → LLM expands USER_INPUT into a full cinematic prompt
 
-LORA_TRIGGERS = ""          # @param {type:"string"}
-# LoRA trigger words injected at the start of every expanded prompt.
-# e.g. "ohwx woman" or "film grain, 35mm"
+LORA_TRIGGERS = "Ultra HDR, cinematic, hyperrealistic detailing, dramatic lighting, vibrant colors"  # @param {type:"string"}
+# LoRA trigger words injected at the START of every LLM-expanded prompt.
+# These ensure professional quality keywords are always present.
+# The LTX2PromptArchitect node injects these before the generated text.
+# Customize per project: "film grain, 35mm" or "anime style, cel-shaded" etc.
 
 # ── LLM Offline Mode & Local Paths ───────────────────────────────────────────
 LLM_OFFLINE_MODE = False    # @param {type:"boolean"}
@@ -2484,9 +2486,35 @@ def decompose_script_to_scenes(
             else:
                 dialogue_text = " [Natural spoken dialogue, realistic lip movements]"
 
-        # Build the full prompt based on output format
+        # ── Build scene dict with PROPER LTX-2 prompt separation ─────────────
+        # The LTX2PromptArchitect LLM expects:
+        #   user_input   = simple action/story (what happens in this shot)
+        #   scene_context (via character_description) = character + style + camera info
+        # The LLM then builds the prompt in LTX-2's preferred structure:
+        #   style -> camera -> character -> scene -> action -> movement -> audio
+        #
+        # Quality keywords are injected via LORA_TRIGGERS (the node prepends them
+        # to every generated prompt automatically). Do NOT stuff quality/style
+        # into user_input -- that confuses the LLM into double-expansion.
+
+        # Raw action for the LLM (simple, natural language)
+        _llm_input = action_text + dialogue_text
+        if seg_idx > 0:
+            _llm_input += " Maintain visual continuity with previous shot."
+
+        # Scene context for LLM (grounding information it should preserve)
+        _scene_ctx = ""
+        if character_def:
+            _scene_ctx += f"Main character: {character_def}. "
+        if secondary_char:
+            _scene_ctx += f"Second character: {secondary_char}. "
+        _scene_ctx += f"Visual style: {style}. "
+        _scene_ctx += f"Camera movement: {camera_lora}. "
+        if has_dialogue and language != "English":
+            _scene_ctx += f"Dialogue language: {language}. "
+
+        # Store JSON metadata for export (output_format == "json")
         if output_format == "json":
-            # Sora-style JSON scene description
             scene_json = {
                 "scene_number": seg_idx + 1,
                 "duration_seconds": segment_duration,
@@ -2501,29 +2529,10 @@ def decompose_script_to_scenes(
                 "style": style,
                 "timestamp": f"{int(cumulative_time//60):02d}:{int(cumulative_time%60):02d}",
             }
-            # Convert JSON metadata to prompt
-            prompt = (
-                f"{quality_prefix}, {style_prefix}, "
-                f"{char_prefix}{action_text}{dialogue_text}, "
-                f"camera: {camera_lora} movement, "
-                f"{'consistent lighting from previous scene, ' if seg_idx > 0 else 'establishing shot lighting, '}"
-                f"scene {seg_idx + 1}/{num_segments}"
-            )
-        elif output_format == "detailed":
-            # Full cinematic prompt
-            prompt = (
-                f"{quality_prefix}, {style_prefix}, "
-                f"{char_prefix}{action_text}{dialogue_text}, "
-                f"{'smooth transition from previous shot, maintaining continuity, ' if seg_idx > 0 else ''}"
-                f"camera movement: {camera_lora}"
-            )
-        else:
-            # Simple mode
-            prompt = f"{char_prefix}{action_text}{dialogue_text}"
 
         # Build scene dict
         scene_dict = {
-            "user_input": prompt,
+            "user_input": _llm_input,  # RAW action for LLM to expand professionally
             "image_path": _char_image_path if seg_idx == 0 else None,
             "frames": frames_per_segment,
             "seed": _seed + seg_idx,
@@ -2531,7 +2540,7 @@ def decompose_script_to_scenes(
             "character_image_path": _char_image_path,
             "character_mode": _char_mode,
             "character_name": _char_name,
-            "character_description": character_def or _char_desc,
+            "character_description": _scene_ctx,  # Flows to LLM as scene_context
         }
 
         # Store metadata for timeline export
