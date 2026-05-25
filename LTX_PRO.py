@@ -2144,18 +2144,19 @@ LLM_OFFLINE_MODE = False    # @param {type:"boolean"}
 # When True, loads LLM from local disk (LOCAL_PATH_*) instead of downloading.
 # Requires models to be pre-cached at the specified paths.
 
-LOCAL_PATH_3B = "/content/ComfyUI/huggingface/hub/models--huihui-ai--Llama-3.2-3B-Instruct-abliterated/snapshots/ba0be3c4683117ffe70be5cc767723e0210e437e"  # @param {type:"string"}
+LOCAL_PATH_3B = "/root/.cache/huggingface/hub/models--huihui-ai--Llama-3.2-3B-Instruct-abliterated/snapshots/ba0be3c4683117ffe70be5cc767723e0210e437e"  # @param {type:"string"}
 # Local path for 3B model (Llama-3.2-3B-Instruct-abliterated).
-# Default matches HuggingFace cache structure.
-# Original cache: /root/.cache/huggingface/hub/models--huihui-ai--Llama-3.2-3B-Instruct-abliterated/snapshots/...
+# Default: HuggingFace cache path (/root/.cache/huggingface/hub/...).
+# The snapshot hash must match what's on disk. Run: ls /root/.cache/huggingface/hub/models--huihui-ai--Llama-3.2-3B-Instruct-abliterated/snapshots/
 
-LOCAL_PATH_8B = "/content/ComfyUI/huggingface/hub/models--NeuralDaredevil--Llama-3.1-8B-abliterated/snapshots/latest"  # @param {type:"string"}
+LOCAL_PATH_8B = "/root/.cache/huggingface/hub/models--mlabonne--NeuralDaredevil-8B-abliterated/snapshots/6567010926ff93a5e9fb809534d61ab667a86674"  # @param {type:"string"}
 # Local path for 8B model (NeuralDaredevil-8B-abliterated).
-# Set to your local snapshot directory.
+# Default: HuggingFace cache path. Change to match your snapshot ID.
+# Alternative: /content/ComfyUI/huggingface/hub/models--mlabonne--NeuralDaredevil-8B-abliterated/snapshots/...
 
-LOCAL_PATH_14B = "/content/ComfyUI/huggingface/hub/models--Qwen--Qwen3-14B-abliterated/snapshots/latest"  # @param {type:"string"}
+LOCAL_PATH_14B = "/root/.cache/huggingface/hub/models--Qwen--Qwen3-14B-abliterated/snapshots/latest"  # @param {type:"string"}
 # Local path for 14B model (Qwen3-14B-abliterated).
-# Set to your local snapshot directory.
+# Default: HuggingFace cache path. Set to your local snapshot directory.
 
 # ── Vision image describer (LTX2VisionDescribe node) ─────────────────────────
 USE_VISION   = True          # @param {type:"boolean"}
@@ -2169,9 +2170,35 @@ VISION_MODEL = "3B-fast"     # @param ["3B-fast", "7B-nsfw"]
 VISION_OFFLINE_MODE = False  # @param {type:"boolean"}
 # When True, loads Vision model from VISION_LOCAL_PATH instead of downloading.
 
-VISION_LOCAL_PATH = "/content/ComfyUI/huggingface/hub/models--huihui-ai--Qwen2.5-VL-3B-Instruct-abliterated/snapshots/latest"  # @param {type:"string"}
+VISION_LOCAL_PATH = "/root/.cache/huggingface/hub/models--huihui-ai--Qwen2.5-VL-3B-Instruct-abliterated/snapshots/latest"  # @param {type:"string"}
 # Local path for Vision model (Qwen2.5-VL-3B or 7B).
-# Set to your local snapshot directory.
+# Default: HuggingFace cache path. Run: ls /root/.cache/huggingface/hub/models--huihui-ai--Qwen2.5-VL-3B-Instruct-abliterated/snapshots/
+
+# ── Auto-resolve snapshot paths (finds actual hash if "latest" doesn't exist) ─
+def _resolve_local_path(path: str) -> str:
+    """Resolve a local model path, auto-detecting snapshot hash if needed."""
+    if not path:
+        return path
+    if os.path.exists(path):
+        return path
+    # If path ends with /latest or doesn't exist, try to find the actual snapshot
+    parent = os.path.dirname(path)
+    if os.path.exists(parent):
+        snapshots = [d for d in os.listdir(parent)
+                     if os.path.isdir(os.path.join(parent, d))]
+        if snapshots:
+            resolved = os.path.join(parent, snapshots[0])
+            print(f"   [path-resolve] Auto-resolved: .../{os.path.basename(parent)}/snapshots/{snapshots[0]}")
+            return resolved
+    return path
+
+# Auto-resolve paths at config time (finds actual snapshot hash on disk)
+if LLM_OFFLINE_MODE:
+    LOCAL_PATH_3B  = _resolve_local_path(LOCAL_PATH_3B)
+    LOCAL_PATH_8B  = _resolve_local_path(LOCAL_PATH_8B)
+    LOCAL_PATH_14B = _resolve_local_path(LOCAL_PATH_14B)
+if VISION_OFFLINE_MODE:
+    VISION_LOCAL_PATH = _resolve_local_path(VISION_LOCAL_PATH)
 
 # ── Display & output ──────────────────────────────────────────────────────────
 SHOW_PREVIEWS           = True   # @param {type:"boolean"}
@@ -2247,7 +2274,10 @@ CHARACTER_STRENGTH = 1.0     # @param {type:"number"}
 # 0.0-1.0 — how strongly to enforce character appearance.
 # 1.0 = maximum fidelity to reference.  0.5 = balanced.
 
-CHARACTER_CONSISTENCY_MODE = "i2v"  # @param ["i2v", "anchor", "both", "none"]
+CHARACTER_CONSISTENCY_MODE = "both"  # @param ["i2v", "anchor", "both", "none"]
+# "both"   → RECOMMENDED for storyboard. Uses BOTH I2V conditioning (temporal
+#            continuity) AND anchor latent injection (identity preservation).
+#            This is the SVI-Pro dual-anchor approach for maximum consistency.
 # "i2v"    → LTXVImgToVideoInplace — injects character image directly into
 #            the video latent as the first frame (strong, natural motion).
 # "anchor" → VAEEncode → anchor_samples SetNode — encodes character image
